@@ -1,7 +1,7 @@
 # Milo
 
-Milo is a minimal native Wayland desktop-companion experiment for GTK4 and
-Hyprland. It displays only a transparent, undecorated `Milo 🐈` label in a
+Milo is a minimal native Wayland desktop companion for GTK4 and Hyprland. It
+displays a four-frame illustrated idle animation in a transparent, undecorated,
 small normal Wayland toplevel window.
 
 ## Native dependency
@@ -70,6 +70,16 @@ hyprctl clients
 Drag Milo with the left mouse button. Press Ctrl+C in the launching terminal
 to quit.
 
+## Idle animation
+
+The four transparent PNG frames under `assets/milo/idle/` are loaded once as
+GDK textures. A single `GtkPicture` displays them at 128 × 128 logical pixels
+with aspect-preserving smooth scaling. GLib one-shot main-loop timeouts advance
+the texture using per-frame timings of 600, 350, 150, and 350 milliseconds,
+followed by an additional 900-millisecond pause on the first frame. All source
+frames share the same 256 × 256 canvas, and the picture and window remain the
+same size as frames change.
+
 ## How dragging works
 
 `GtkApplicationWindow` creates a normal `GdkSurface` that implements the
@@ -81,5 +91,5 @@ movement until release. Milo contains no pointer-motion loop, coordinate
 calculation, layer-shell margins, or `hyprctl` movement commands.
 
 The transparent surface still receives pointer input; transparent-pixel
-click-through is not implemented. Milo has no sprites, animation, persistence,
-tracking, or other companion behavior yet.
+click-through is not implemented. Milo has no other animation states,
+persistence, tracking, or other companion behavior yet.
