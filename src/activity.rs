@@ -46,16 +46,29 @@ pub fn classify_window(window: &ActiveWindow) -> ActivityCategory {
     }
 }
 
-pub fn start_hyprland_activity_monitor<F>(milo_class: &str, mut on_category_change: F)
-where
+pub fn start_hyprland_activity_monitor<F, G>(
+    milo_class: &str,
+    mut on_category_change: F,
+    mut on_current_category: G,
+) where
     F: FnMut(ActivityCategory, ActivityCategory) + 'static,
+    G: FnMut(ActivityCategory) + 'static,
 {
     let (sender, mut receiver) = unbounded();
     let mut context = ActivityContext::new(milo_class);
 
     glib::MainContext::default().spawn_local(async move {
         while let Some(window) = receiver.next().await {
-            if let Some((previous, current)) = context.observe(window) {
+            let previous_category = context.current.as_ref().map(classify_window);
+            let transition = context.observe(window);
+            let current_category = context.current.as_ref().map(classify_window);
+
+            if current_category != previous_category
+                && let Some(current) = current_category
+            {
+                on_current_category(current);
+            }
+            if let Some((previous, current)) = transition {
                 on_category_change(previous, current);
             }
         }

@@ -57,13 +57,17 @@ impl BehaviorController {
         }
     }
 
-    pub fn start_idle_monitor(&self) {
+    pub fn start_idle_monitor<F>(&self, mut on_system_idle_change: F)
+    where
+        F: FnMut(bool) + 'static,
+    {
         let (sender, mut receiver) = unbounded();
         let controller = self.clone();
 
         glib::MainContext::default().spawn_local(async move {
             while let Some(event) = receiver.next().await {
                 controller.handle_activity_event(event);
+                on_system_idle_change(matches!(event, ActivityEvent::Idled));
             }
         });
 

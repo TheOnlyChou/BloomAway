@@ -148,16 +148,15 @@ Milo also listens on the user-local Unix socket
 `0700` and the socket is mode `0600`. A dedicated listener thread accepts
 newline-delimited JSON from `milo-native-host`, validates it, and sends only the
 parsed `BrowserActivity` through a channel to a task on the GLib main context.
-The main-context callback currently does nothing except log, for example:
+The main-context callback logs each received category, for example:
 
 ```text
 [milo] browser activity: YouTubeShorts
 ```
 
-`BrowserActivity` is deliberately separate from Hyprland's
+`BrowserActivity` remains deliberately separate from Hyprland's
 `ActivityCategory::Browser`: one describes Firefox's selected category and the
-other describes the focused desktop application. Browser events do not alter
-Milo's animation or behavior.
+other describes the focused desktop application.
 
 Firefox launches only the small `milo-native-host` binary, never the GTK Milo
 binary. Native Messaging stdin uses a four-byte native-endian unsigned length
@@ -170,6 +169,52 @@ See [extension/README.md](extension/README.md) for the user-level Firefox host
 installation, removal, extension identity/authorization, and exact manual test
 procedure. Milo remains usable without Firefox, and Firefox remains usable
 without Milo.
+
+## Continuous distraction sessions
+
+One in-memory controller combines the current desktop category, latest browser
+category, and system-idle status. A session exists only while the desktop
+category is `Browser`, the system is active, and the browser category is either
+`YouTubeShorts` or `InstagramReels`. Normal YouTube, Instagram, and all other
+pages do not start sessions.
+
+Sessions use `std::time::Instant`, so elapsed time is monotonic and unaffected
+by wall-clock adjustments. A one-second GLib timeout checks elapsed time with
+negligible wakeups. Each session tracks its next unreported threshold, making
+the development thresholds at 10, 20, and 30 seconds fire exactly once even if
+one timer check crosses more than one deadline.
+
+Leaving the Browser desktop category, changing to a non-distracting browser
+category, losing the Firefox/native-host connection, or becoming system-idle
+ends the current session immediately. Changing directly between Shorts and
+Reels logs the old session's end and starts a new session at zero. Returning
+from another application or system idle likewise starts a fresh continuous
+session if the combined context still qualifies. No separated visits are
+accumulated or persisted.
+
+Distraction events currently produce logs only:
+
+```text
+[milo] distraction started: YouTubeShorts
+[milo] distraction 10s: YouTubeShorts
+[milo] distraction ended: YouTubeShorts (13.4s)
+```
+
+They do not call `BehaviorController`, change `MiloState`, close tabs, block
+sites, or produce dialogue or scores.
+
+### Manual distraction-session test
+
+1. Start Milo, load the Firefox extension, and focus YouTube Shorts. Confirm a
+   `distraction started` log.
+2. Wait about 10 seconds and confirm one `distraction 10s` log.
+3. Switch to kitty before 20 seconds and confirm the session ends with its
+   elapsed duration.
+4. Return to Firefox Shorts and confirm a new session starts from zero.
+5. Stay for 30 seconds and confirm the 10s, 20s, and 30s logs each appear once.
+6. Open normal YouTube and confirm the session ends immediately.
+7. Start another Shorts session and leave the computer idle; confirm it ends
+   when Milo enters its system-idle state.
 
 ## How dragging works
 

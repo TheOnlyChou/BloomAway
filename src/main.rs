@@ -2,11 +2,13 @@ mod activity;
 mod animation;
 mod behavior;
 mod browser_listener;
+mod distraction;
 
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
 use behavior::BehaviorController;
-use browser_listener::start_browser_activity_monitor;
+use browser_listener::{BrowserActivityEvent, start_browser_activity_monitor};
+use distraction::DistractionController;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::sync::{
@@ -96,13 +98,30 @@ fn build_ui(app: &gtk::Application) {
 
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
     let behavior = BehaviorController::new(animator);
-    behavior.start_idle_monitor();
-    let activity_behavior = behavior.clone();
-    start_hyprland_activity_monitor(APPLICATION_ID, move |previous, current| {
-        activity_behavior.handle_category_change(previous, current);
+    let distraction = DistractionController::new();
+    distraction.start_threshold_monitor();
+
+    let idle_distraction = distraction.clone();
+    behavior.start_idle_monitor(move |system_idle| {
+        idle_distraction.update_system_idle(system_idle);
     });
-    start_browser_activity_monitor(|activity| {
-        eprintln!("[milo] browser activity: {activity:?}");
+    let activity_behavior = behavior.clone();
+    let desktop_distraction = distraction.clone();
+    start_hyprland_activity_monitor(
+        APPLICATION_ID,
+        move |previous, current| {
+            activity_behavior.handle_category_change(previous, current);
+        },
+        move |current| {
+            desktop_distraction.update_desktop_activity(current);
+        },
+    );
+    start_browser_activity_monitor(move |event| match event {
+        BrowserActivityEvent::Activity(activity) => {
+            eprintln!("[milo] browser activity: {activity:?}");
+            distraction.update_browser_activity(activity);
+        }
+        BrowserActivityEvent::Unavailable => distraction.browser_unavailable(),
     });
     setup_native_drag(&window);
     setup_debug_state_switch(&window, behavior);

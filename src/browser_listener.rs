@@ -9,9 +9,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::thread;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserActivityEvent {
+    Activity(BrowserActivity),
+    Unavailable,
+}
+
 pub fn start_browser_activity_monitor<F>(mut on_browser_activity: F)
 where
-    F: FnMut(BrowserActivity) + 'static,
+    F: FnMut(BrowserActivityEvent) + 'static,
 {
     let (sender, mut receiver) = unbounded();
 
@@ -33,7 +39,7 @@ where
     }
 }
 
-fn run_browser_listener(sender: UnboundedSender<BrowserActivity>) -> io::Result<()> {
+fn run_browser_listener(sender: UnboundedSender<BrowserActivityEvent>) -> io::Result<()> {
     let socket_path = browser_socket_path()?;
     let listener = bind_local_socket(&socket_path)?;
 
@@ -43,7 +49,10 @@ fn run_browser_listener(sender: UnboundedSender<BrowserActivity>) -> io::Result<
                 if let Err(error) = forward_browser_messages(stream, &sender) {
                     eprintln!("[milo] browser connection closed: {error}");
                 }
-                if sender.is_closed() {
+                if sender
+                    .unbounded_send(BrowserActivityEvent::Unavailable)
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
@@ -128,11 +137,14 @@ fn secure_listener(listener: UnixListener, socket_path: &Path) -> io::Result<Uni
 
 fn forward_browser_messages(
     stream: UnixStream,
-    sender: &UnboundedSender<BrowserActivity>,
+    sender: &UnboundedSender<BrowserActivityEvent>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     while let Some(message) = read_local_message(&mut reader)? {
-        if sender.unbounded_send(message.activity).is_err() {
+        if sender
+            .unbounded_send(BrowserActivityEvent::Activity(message.activity))
+            .is_err()
+        {
             return Ok(());
         }
     }
