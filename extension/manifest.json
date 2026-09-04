@@ -3,8 +3,13 @@
   "name": "Milo Browser Activity",
   "version": "0.1.0",
   "description": "Classifies the active Firefox tab for Milo development.",
-  "permissions": ["tabs"],
+  "permissions": ["tabs", "nativeMessaging"],
   "background": {
     "scripts": ["background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "milo-browser-activity@bloomaway.local"
+    }
   }
 }

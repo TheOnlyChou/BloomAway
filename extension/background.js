@@ -6,10 +6,60 @@ const BrowserActivity = Object.freeze({
   Other: "Other",
 });
 
+const NATIVE_HOST_NAME = "com.milo.desktop";
+const NativeActivity = Object.freeze({
+  [BrowserActivity.YouTube]: "youtube",
+  [BrowserActivity.YouTubeShorts]: "youtube_shorts",
+  [BrowserActivity.Instagram]: "instagram",
+  [BrowserActivity.InstagramReels]: "instagram_reels",
+  [BrowserActivity.Other]: "other",
+});
+
 let activeWindowId = null;
 let activeTabId = null;
 let selectionGeneration = 0;
 let previousActivity = null;
+let nativePort = null;
+
+function connectNativeHost() {
+  if (nativePort !== null) {
+    return nativePort;
+  }
+
+  try {
+    const port = browser.runtime.connectNative(NATIVE_HOST_NAME);
+    nativePort = port;
+    port.onDisconnect.addListener(() => {
+      if (nativePort === port) {
+        nativePort = null;
+        console.warn("[milo-extension] native host disconnected");
+      }
+    });
+    return port;
+  } catch (error) {
+    console.warn("[milo-extension] could not connect to native host", error);
+    return null;
+  }
+}
+
+function sendActivity(activity) {
+  const port = connectNativeHost();
+  if (port === null) {
+    return;
+  }
+
+  try {
+    port.postMessage({
+      type: "browser_activity",
+      activity: NativeActivity[activity],
+    });
+  } catch (error) {
+    if (nativePort === port) {
+      nativePort = null;
+    }
+    console.warn("[milo-extension] could not send browser activity", error);
+  }
+}
 
 function classifyUrl(rawUrl) {
   if (typeof rawUrl !== "string" || rawUrl.length === 0) {
@@ -54,6 +104,7 @@ function observeUrl(rawUrl) {
   const displayUrl =
     typeof rawUrl === "string" && rawUrl.length > 0 ? rawUrl : "(no URL)";
   console.log(`[milo-extension] ${activity}\n${displayUrl}`);
+  sendActivity(activity);
 }
 
 async function selectTab(tabId, windowId) {

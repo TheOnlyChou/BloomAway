@@ -1,16 +1,48 @@
 # Milo Firefox extension
 
-This development-only WebExtension classifies the active Firefox tab as one
-of `YouTube`, `YouTubeShorts`, `Instagram`, `InstagramReels`, or `Other`. It
-prints category transitions locally in the extension background console. It
-does not communicate with Milo's Rust application.
+This development WebExtension classifies only the active Firefox tab as
+`YouTube`, `YouTubeShorts`, `Instagram`, `InstagramReels`, or `Other`. Category
+transitions are logged in the background console and sent to Milo through
+Firefox Native Messaging. Repeated categories remain deduplicated.
 
 ## Permissions
 
-The Manifest V3 extension requests only `tabs`. Firefox requires that
-permission for a background script to read `Tab.url`. There are no host
-permissions, content scripts, injected code, network requests, or persistent
-storage.
+The Manifest V3 extension requests `tabs` so its background script can read the
+active `Tab.url`, plus `nativeMessaging` so it can connect to
+`com.milo.desktop`. It has no host permissions, content scripts, injected code,
+network requests, or storage.
+
+The stable Gecko extension ID is
+`milo-browser-activity@bloomaway.local`. The native host manifest lists exactly
+that ID in `allowed_extensions`; Firefox therefore exposes this host only to
+the Milo extension.
+
+## Build and install the development native host
+
+From the repository root:
+
+```bash
+cargo build --bin milo-native-host
+./extension/native-host/install.sh
+```
+
+The script resolves the binary to an absolute path and generates the manifest
+at Arch Linux native Firefox's user-level location:
+
+```text
+~/.mozilla/native-messaging-hosts/com.milo.desktop.json
+```
+
+No root access is used. The committed JSON is a template with a
+`__MILO_NATIVE_HOST_PATH__` placeholder. To select another built binary, pass
+its path to the script. To remove the development registration, remove only
+the generated manifest:
+
+```bash
+rm ~/.mozilla/native-messaging-hosts/com.milo.desktop.json
+```
+
+This does not edit any Firefox profile or extension file.
 
 ## Load temporarily in Firefox
 
@@ -21,8 +53,9 @@ storage.
 5. Find **Milo Browser Activity** in the temporary extensions list and select
    **Inspect** to open its background console.
 
-After changing either extension file, use **Reload** on the extension's
-`about:debugging` entry. A temporary extension is removed when Firefox exits.
+After changing an extension file or reinstalling the host, use **Reload** on
+the extension's `about:debugging` entry. A temporary extension is removed when
+Firefox exits.
 
 ## Event handling
 
@@ -39,6 +72,20 @@ The selected tab and previous category exist only in memory. Background-tab
 updates are ignored. Repeated events for the same category are deduplicated,
 including different videos or pages that remain within one category.
 
+The extension keeps one persistent
+`runtime.connectNative("com.milo.desktop")` port. On disconnect it clears the
+port; a later category transition makes one new connection attempt. There is
+no retry timer, and a missing host or stopped Milo cannot interrupt browsing.
+
+Only messages with this shape cross Native Messaging:
+
+```json
+{"type":"browser_activity","activity":"youtube_shorts"}
+```
+
+The other values are `youtube`, `instagram`, `instagram_reels`, and `other`.
+Full URLs and page titles are never sent to the native host.
+
 ## URL classification
 
 `classifyUrl(url)` uses the built-in `URL` parser and exact host matching.
@@ -48,7 +95,31 @@ or `www.instagram.com` receive site categories. YouTube paths beginning with
 `/reels/` become `InstagramReels`. Missing, malformed, internal, and all other
 URLs become `Other`.
 
-## Manual test cases
+## Exact manual integration test
+
+1. Build both executables and install the development host:
+
+   ```bash
+   cargo build
+   ./extension/native-host/install.sh
+   ```
+
+2. Start Milo with `cargo run`.
+3. Load or reload `extension/manifest.json` through `about:debugging`.
+4. Open normal YouTube. Expected Milo output:
+
+   ```text
+   [milo] browser activity: YouTube
+   ```
+
+5. Open YouTube Shorts. Expected: `[milo] browser activity: YouTubeShorts`.
+6. Open Instagram. Expected: `[milo] browser activity: Instagram`.
+7. Open Reels. Expected: `[milo] browser activity: InstagramReels`.
+8. Open another site to verify `Other` if desired.
+9. Stop Milo and continue browsing. Firefox pages must continue working; the
+   extension console may report a native-host disconnect.
+
+## Classification test cases
 
 With the background console open, activate tabs containing these URLs:
 
@@ -81,6 +152,7 @@ To verify filtering and deduplication:
 4. Move between two Shorts videos. No second `YouTubeShorts` event should be
    printed.
 
-No browsing history is collected, URLs are not persisted or transmitted, and
-the extension performs no scoring, blocking, intervention, content inspection,
-scroll monitoring, or Native Messaging.
+No browsing history is collected. URLs are not persisted or transmitted (they
+appear only in the existing local debug log), and browser activity remains
+ephemeral. The extension performs no scoring, timers, blocking, tab closing,
+intervention, content inspection, scroll monitoring, dialogue, or state logic.

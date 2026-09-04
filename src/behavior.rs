@@ -1,8 +1,9 @@
+use crate::activity::ActivityCategory;
 use crate::animation::{MiloAnimator, MiloState};
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gtk4::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 
 pub const IDLE_TIMEOUT_SECONDS: u32 = 10;
 pub const CURIOUS_AFTER_RESUME_MS: u64 = 3_000;
+pub const APP_SWITCH_CURIOUS_MS: u64 = 1_500;
 
 #[derive(Clone, Copy, Debug)]
 enum ActivityEvent {
@@ -23,8 +25,17 @@ enum ActivityEvent {
     Resumed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CuriousReaction {
+    Resume,
+    AppSwitch,
+}
+
 struct BehaviorInner {
     animator: MiloAnimator,
+    system_idle: Cell<bool>,
+    curious_reaction: Cell<Option<CuriousReaction>>,
+    reaction_generation: Cell<u64>,
     curious_timeout: RefCell<Option<glib::SourceId>>,
 }
 
@@ -38,6 +49,9 @@ impl BehaviorController {
         Self {
             inner: Rc::new(BehaviorInner {
                 animator,
+                system_idle: Cell::new(false),
+                curious_reaction: Cell::new(None),
+                reaction_generation: Cell::new(0),
                 curious_timeout: RefCell::new(None),
             }),
         }
@@ -74,44 +88,82 @@ impl BehaviorController {
         next_state
     }
 
-    fn handle_activity_event(&self, event: ActivityEvent) {
-        self.cancel_curious_timeout();
+    pub fn handle_category_change(&self, previous: ActivityCategory, current: ActivityCategory) {
+        if previous == current
+            || !app_switch_reaction_allowed(
+                self.inner.system_idle.get(),
+                self.inner.curious_reaction.get(),
+            )
+        {
+            return;
+        }
 
+        eprintln!("[milo] context changed: {previous} -> {current}");
+        eprintln!("[milo] reaction: Curious");
+        self.start_curious_reaction(CuriousReaction::AppSwitch, APP_SWITCH_CURIOUS_MS);
+    }
+
+    fn handle_activity_event(&self, event: ActivityEvent) {
         match event {
             ActivityEvent::Idled => {
+                self.inner.system_idle.set(true);
+                self.cancel_curious_timeout();
                 self.inner.animator.set_state(MiloState::Sleeping);
                 eprintln!("Milo automatic state: Sleeping (user idle)");
             }
             ActivityEvent::Resumed => {
-                self.inner.animator.set_state(MiloState::Curious);
+                self.inner.system_idle.set(false);
                 eprintln!("Milo automatic state: Curious (user resumed)");
-                self.schedule_curious_return();
+                self.start_curious_reaction(CuriousReaction::Resume, CURIOUS_AFTER_RESUME_MS);
             }
         }
     }
 
-    fn schedule_curious_return(&self) {
-        let weak_inner = Rc::downgrade(&self.inner);
-        let timeout = glib::timeout_add_local_once(
-            Duration::from_millis(CURIOUS_AFTER_RESUME_MS),
-            move || {
-                let Some(inner) = weak_inner.upgrade() else {
-                    return;
-                };
+    fn start_curious_reaction(&self, reaction: CuriousReaction, duration_ms: u64) {
+        self.cancel_curious_timeout();
+        self.inner.curious_reaction.set(Some(reaction));
+        self.inner.animator.set_state(MiloState::Curious);
 
-                inner.curious_timeout.borrow_mut().take();
+        let generation = self.inner.reaction_generation.get();
+        let weak_inner = Rc::downgrade(&self.inner);
+        let timeout = glib::timeout_add_local_once(Duration::from_millis(duration_ms), move || {
+            let Some(inner) = weak_inner.upgrade() else {
+                return;
+            };
+            if inner.reaction_generation.get() != generation {
+                return;
+            }
+
+            inner.curious_timeout.borrow_mut().take();
+            inner.curious_reaction.set(None);
+            if inner.system_idle.get() {
+                inner.animator.set_state(MiloState::Sleeping);
+            } else {
                 inner.animator.set_state(MiloState::Idle);
-                eprintln!("Milo automatic state: Idle (resume reaction complete)");
-            },
-        );
+                if reaction == CuriousReaction::Resume {
+                    eprintln!("Milo automatic state: Idle (resume reaction complete)");
+                }
+            }
+        });
         self.inner.curious_timeout.replace(Some(timeout));
     }
 
     fn cancel_curious_timeout(&self) {
+        self.inner
+            .reaction_generation
+            .set(self.inner.reaction_generation.get().wrapping_add(1));
+        self.inner.curious_reaction.set(None);
         if let Some(timeout) = self.inner.curious_timeout.borrow_mut().take() {
             timeout.remove();
         }
     }
+}
+
+fn app_switch_reaction_allowed(
+    system_idle: bool,
+    current_reaction: Option<CuriousReaction>,
+) -> bool {
+    !system_idle && current_reaction != Some(CuriousReaction::Resume)
 }
 
 struct IdleListenerState {
@@ -188,4 +240,23 @@ fn run_idle_listener(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleeping_and_resume_reactions_have_priority_over_app_switches() {
+        assert!(!app_switch_reaction_allowed(true, None));
+        assert!(!app_switch_reaction_allowed(
+            false,
+            Some(CuriousReaction::Resume)
+        ));
+        assert!(app_switch_reaction_allowed(false, None));
+        assert!(app_switch_reaction_allowed(
+            false,
+            Some(CuriousReaction::AppSwitch)
+        ));
+    }
 }

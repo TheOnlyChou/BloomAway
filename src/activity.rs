@@ -6,6 +6,7 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -45,20 +46,17 @@ pub fn classify_window(window: &ActiveWindow) -> ActivityCategory {
     }
 }
 
-pub fn start_hyprland_activity_monitor<F>(milo_class: &str, mut on_change: F)
+pub fn start_hyprland_activity_monitor<F>(milo_class: &str, mut on_category_change: F)
 where
-    F: FnMut(&ActiveWindow, ActivityCategory) + 'static,
+    F: FnMut(ActivityCategory, ActivityCategory) + 'static,
 {
     let (sender, mut receiver) = unbounded();
     let mut context = ActivityContext::new(milo_class);
 
     glib::MainContext::default().spawn_local(async move {
         while let Some(window) = receiver.next().await {
-            if let Some(category) = context.observe(window) {
-                let window = context
-                    .current()
-                    .expect("a reported activity always has a current window");
-                on_change(window, category);
+            if let Some((previous, current)) = context.observe(window) {
+                on_category_change(previous, current);
             }
         }
     });
@@ -90,7 +88,7 @@ impl ActivityContext {
         }
     }
 
-    fn observe(&mut self, window: ActiveWindow) -> Option<ActivityCategory> {
+    fn observe(&mut self, window: ActiveWindow) -> Option<(ActivityCategory, ActivityCategory)> {
         if window.class.trim().is_empty()
             || window.class.trim().eq_ignore_ascii_case(&self.milo_class)
             || self.current.as_ref() == Some(&window)
@@ -98,13 +96,13 @@ impl ActivityContext {
             return None;
         }
 
-        let category = classify_window(&window);
+        let previous_category = self.current.as_ref().map(classify_window);
+        let current_category = classify_window(&window);
         self.current = Some(window);
-        Some(category)
-    }
 
-    fn current(&self) -> Option<&ActiveWindow> {
-        self.current.as_ref()
+        previous_category
+            .filter(|previous| *previous != current_category)
+            .map(|previous| (previous, current_category))
     }
 }
 
@@ -112,6 +110,12 @@ fn run_hyprland_listener(sender: UnboundedSender<ActiveWindow>) -> Result<(), St
     let socket_path = hyprland_event_socket_path()?;
     let first_stream = UnixStream::connect(&socket_path)
         .map_err(|error| format!("could not open {}: {error}", socket_path.to_string_lossy()))?;
+
+    if let Some(window) = query_initial_active_window()
+        && sender.unbounded_send(window).is_err()
+    {
+        return Ok(());
+    }
 
     let mut stream = first_stream;
     loop {
@@ -138,6 +142,34 @@ fn run_hyprland_listener(sender: UnboundedSender<ActiveWindow>) -> Result<(), St
             }
         }
     }
+}
+
+fn query_initial_active_window() -> Option<ActiveWindow> {
+    let output = Command::new("hyprctl").arg("activewindow").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_hyprctl_active_window(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn parse_hyprctl_active_window(output: &str) -> Option<ActiveWindow> {
+    let mut class = None;
+    let mut title = None;
+
+    for line in output.lines() {
+        let field = line.trim_start();
+        if let Some(value) = field.strip_prefix("class:") {
+            class = Some(value.trim_start().to_owned());
+        } else if let Some(value) = field.strip_prefix("title:") {
+            title = Some(value.trim_start().to_owned());
+        }
+    }
+
+    Some(ActiveWindow {
+        class: class?,
+        title: title?,
+    })
 }
 
 fn hyprland_event_socket_path() -> Result<PathBuf, String> {
@@ -210,6 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_initial_hyprctl_window() {
+        let output = "Window 123 -> Project:\n\tclass: kitty\n\ttitle: Project, notes\n";
+
+        assert_eq!(
+            parse_hyprctl_active_window(output),
+            Some(ActiveWindow {
+                class: "kitty".to_owned(),
+                title: "Project, notes".to_owned(),
+            })
+        );
+    }
+
+    #[test]
     fn classifies_classes_case_insensitively() {
         let window = ActiveWindow {
             class: "FiReFoX".to_owned(),
@@ -231,12 +276,9 @@ mod tests {
             title: "Milo".to_owned(),
         };
 
-        assert_eq!(
-            context.observe(kitty.clone()),
-            Some(ActivityCategory::Terminal)
-        );
+        assert_eq!(context.observe(kitty.clone()), None);
         assert_eq!(context.observe(milo), None);
-        assert_eq!(context.current(), Some(&kitty));
+        assert_eq!(context.current.as_ref(), Some(&kitty));
     }
 
     #[test]
@@ -247,10 +289,59 @@ mod tests {
             title: "Milo".to_owned(),
         };
 
-        assert_eq!(
-            context.observe(window.clone()),
-            Some(ActivityCategory::Development)
-        );
+        assert_eq!(context.observe(window.clone()), None);
         assert_eq!(context.observe(window), None);
+    }
+
+    #[test]
+    fn title_only_changes_update_context_without_reporting_a_transition() {
+        let mut context = ActivityContext::new("com.milo.desktop");
+        let first = ActiveWindow {
+            class: "kitty".to_owned(),
+            title: "fish".to_owned(),
+        };
+        let second = ActiveWindow {
+            class: "kitty".to_owned(),
+            title: "~/Projects/BloomAway".to_owned(),
+        };
+
+        assert_eq!(context.observe(first), None);
+        assert_eq!(context.observe(second.clone()), None);
+        assert_eq!(context.current.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn reports_only_category_transitions() {
+        let mut context = ActivityContext::new("com.milo.desktop");
+        let terminal = ActiveWindow {
+            class: "kitty".to_owned(),
+            title: "project".to_owned(),
+        };
+        let browser = ActiveWindow {
+            class: "firefox".to_owned(),
+            title: "Milo docs".to_owned(),
+        };
+
+        assert_eq!(context.observe(terminal), None);
+        assert_eq!(
+            context.observe(browser),
+            Some((ActivityCategory::Terminal, ActivityCategory::Browser))
+        );
+    }
+
+    #[test]
+    fn different_apps_in_the_same_category_do_not_report_a_transition() {
+        let mut context = ActivityContext::new("com.milo.desktop");
+        let firefox = ActiveWindow {
+            class: "firefox".to_owned(),
+            title: "Tab A".to_owned(),
+        };
+        let chromium = ActiveWindow {
+            class: "chromium".to_owned(),
+            title: "Tab B".to_owned(),
+        };
+
+        assert_eq!(context.observe(firefox), None);
+        assert_eq!(context.observe(chromium), None);
     }
 }

@@ -1,0 +1,7 @@
+{
+  "name": "com.milo.desktop",
+  "description": "Forwards Firefox browser activity categories to Milo",
+  "path": "__MILO_NATIVE_HOST_PATH__",
+  "type": "stdio",
+  "allowed_extensions": ["milo-browser-activity@bloomaway.local"]
+}

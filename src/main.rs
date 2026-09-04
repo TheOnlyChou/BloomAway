@@ -1,10 +1,12 @@
 mod activity;
 mod animation;
 mod behavior;
+mod browser_listener;
 
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
 use behavior::BehaviorController;
+use browser_listener::start_browser_activity_monitor;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::sync::{
@@ -95,9 +97,12 @@ fn build_ui(app: &gtk::Application) {
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
     let behavior = BehaviorController::new(animator);
     behavior.start_idle_monitor();
-    start_hyprland_activity_monitor(APPLICATION_ID, |window, category| {
-        eprintln!("[milo] active window: {} | {}", window.class, window.title);
-        eprintln!("[milo] activity: {category}");
+    let activity_behavior = behavior.clone();
+    start_hyprland_activity_monitor(APPLICATION_ID, move |previous, current| {
+        activity_behavior.handle_category_change(previous, current);
+    });
+    start_browser_activity_monitor(|activity| {
+        eprintln!("[milo] browser activity: {activity:?}");
     });
     setup_native_drag(&window);
     setup_debug_state_switch(&window, behavior);

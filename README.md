@@ -71,12 +71,12 @@ Drag Milo with the left mouse button. For development, right-click Milo to
 cycle through Idle, Sleeping, Curious, and back to Idle. The selected state is
 printed in the launching terminal. Press Ctrl+C there to quit.
 
-While Milo is running, focus different application windows to inspect their
-Hyprland classes and activity categories:
+While Milo is running, focus applications in different activity categories to
+see the context transition and visual reaction:
 
 ```text
-[milo] active window: firefox | ChatGPT — Mozilla Firefox
-[milo] activity: Browser
+[milo] context changed: Terminal -> Browser
+[milo] reaction: Curious
 ```
 
 ## Animation states
@@ -116,23 +116,60 @@ thread blocks on the socket and forwards only parsed `activewindow` events to a
 task on the GLib main context. The event payload is split at its first comma,
 so later commas remain part of the title.
 
-Application identity comes from the event's window class, not its title.
+Application identity comes from the window class, not its title.
 Firefox, Google Chrome, and Chromium are classified as Browser; Code and
 Code OSS as Development; kitty and Alacritty as Terminal; Steam as Gaming;
 Spotify as Media; and unmatched classes as Other. Matching is
-case-insensitive. The terminal output always includes the actual class emitted
-by Hyprland, making new mappings easy to verify before adding them.
+case-insensitive.
 
 Events for `com.milo.desktop` and empty classes are ignored, and the last
 non-Milo window remains the meaningful activity context. Identical consecutive
-window events are also ignored. Active application observation does not change
-Milo's animation state, so Sleeping and the existing resume reaction retain
-their current behavior.
+window events are also ignored. A change between two different activity
+categories makes Milo Curious for 1.5 seconds before returning to Idle. Changes
+within one category, including title-only changes, update the retained window
+without triggering a reaction or log.
+
+System idle has priority over application reactions. An app switch cannot wake
+Sleeping Milo or replace the existing three-second resume reaction. All
+temporary reactions share one cancellable GLib timeout, guarded by a generation
+number so an obsolete callback cannot restore Idle after a newer event.
 
 If the event socket is unavailable at startup, Milo reports that activity
 tracking is unavailable and continues normally. If an established connection
 drops, the listener retries the same socket every two seconds without polling
-active-window state.
+active-window state. Milo queries `hyprctl activewindow` once after initially
+connecting so the first subsequent socket event can be compared with the
+application that was already focused at startup.
+
+## Firefox browser activity bridge
+
+Milo also listens on the user-local Unix socket
+`$XDG_RUNTIME_DIR/milo/browser.sock`. The socket's parent directory is mode
+`0700` and the socket is mode `0600`. A dedicated listener thread accepts
+newline-delimited JSON from `milo-native-host`, validates it, and sends only the
+parsed `BrowserActivity` through a channel to a task on the GLib main context.
+The main-context callback currently does nothing except log, for example:
+
+```text
+[milo] browser activity: YouTubeShorts
+```
+
+`BrowserActivity` is deliberately separate from Hyprland's
+`ActivityCategory::Browser`: one describes Firefox's selected category and the
+other describes the focused desktop application. Browser events do not alter
+Milo's animation or behavior.
+
+Firefox launches only the small `milo-native-host` binary, never the GTK Milo
+binary. Native Messaging stdin uses a four-byte native-endian unsigned length
+followed by exactly that many UTF-8 JSON bytes. The helper rejects frames above
+64 KiB before allocating their payload, writes diagnostics only to stderr, and
+forwards valid category-only messages to the Unix socket as one JSON object per
+line. It opens no TCP ports and persists nothing.
+
+See [extension/README.md](extension/README.md) for the user-level Firefox host
+installation, removal, extension identity/authorization, and exact manual test
+procedure. Milo remains usable without Firefox, and Firefox remains usable
+without Milo.
 
 ## How dragging works
 
