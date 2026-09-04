@@ -1,21 +1,59 @@
 # Milo
 
-Milo is currently a minimal native Wayland overlay prototype for GTK4 and
-Hyprland. It displays a transparent, undecorated window with a 140 × 80 minimum
-size around a temporary `Milo 🐈` label.
+Milo is a minimal native Wayland desktop-companion experiment for GTK4 and
+Hyprland. It displays only a transparent, undecorated `Milo 🐈` label in a
+small normal Wayland toplevel window.
 
 ## Native dependency
 
-On Arch Linux, install the GTK layer-shell library before building:
+GTK4 is required. On Arch Linux:
 
 ```bash
-sudo pacman -S --needed gtk4-layer-shell
+sudo pacman -S --needed gtk4
 ```
 
-GTK4 itself is also required (`gtk4`), but it was already installed when this
-prototype was created.
+Milo does not use `gtk4-layer-shell` and does not create a fullscreen or layer
+surface.
 
-## Run
+## Hyprland 0.56 rule
+
+This machine runs Hyprland 0.56.2 and loads Lua configuration from
+`~/.config/hypr/hyprland.lua`, with user rules in
+`~/.config/hypr/custom/rules.lua`. Add this single Milo-specific rule to the
+custom rules file:
+
+```lua
+hl.window_rule({
+    name = "milo-desktop-companion",
+    match = { class = "^com\\.milo\\.desktop$" },
+    float = true,
+    pin = true,
+    no_initial_focus = true,
+    decorate = false,
+    move = { "(monitor_w-window_w-24)", "(monitor_h-window_h-24)" }
+})
+```
+
+Reload the config after saving it:
+
+```bash
+hyprctl reload
+```
+
+The rule matches the `class` field shown by `hyprctl clients`. For this native
+Wayland GTK application, that class is its stable GApplication/Wayland app ID,
+`com.milo.desktop`. Its stable window title is `Milo`. The class is the better
+match because it is intended as application identity rather than display text.
+
+`float` keeps the small toplevel out of the tiling layout, `pin` displays it on
+all workspaces, `no_initial_focus` stops it taking startup focus, and
+`decorate = false` disables Hyprland's compositor decorations around the
+already-undecorated GTK window. `move` is evaluated when the rule is initially
+applied: the monitor dimensions minus Milo's actual window dimensions and 24
+pixels place it at the bottom-right. Nothing continuously enforces the
+position, so a compositor drag leaves Milo where it is dropped.
+
+## Run and inspect
 
 From this directory, in a running Hyprland session:
 
@@ -23,25 +61,25 @@ From this directory, in a running Hyprland session:
 cargo run
 ```
 
-Milo should appear at x=50, y=50 from the monitor's top-left corner. Drag the
-label with the left mouse button to move it, and press Ctrl+C in the launching
-terminal to quit.
+Inspect the mapped window and its class with:
 
-## How it works
+```bash
+hyprctl clients
+```
 
-`gtk4-layer-shell` turns the `GtkApplicationWindow` into a Wayland layer
-surface before it is shown. Milo anchors only to the top and left edges. Those
-two margins represent its x/y position and are updated by a GTK drag gesture.
-Startup does not depend on monitor detection or GTK allocation timing. During a
-drag, once the surface is mapped and has a positive allocation, its position is
-clamped using the current monitor geometry and Milo's allocated size.
+Drag Milo with the left mouse button. Press Ctrl+C in the launching terminal
+to quit.
 
-Milo uses the overlay layer, reserves no screen space, and requests no keyboard
-input. Minimal CSS removes the themed window background, border, and shadow;
-only the label is drawn. The small synchronous `ctrlc` crate lets Ctrl+C request
-an orderly GTK application shutdown; it does not add an async runtime.
+## How dragging works
+
+`GtkApplicationWindow` creates a normal `GdkSurface` that implements the
+`GdkToplevel` interface. On a real left-button press, Milo reads the event's
+pointer device, surface-relative coordinates, button number, and timestamp,
+then calls `GdkToplevel::begin_move` once. GDK sends the Wayland interactive
+move request and Hyprland owns all subsequent pointer tracking and window
+movement until release. Milo contains no pointer-motion loop, coordinate
+calculation, layer-shell margins, or `hyprctl` movement commands.
 
 The transparent surface still receives pointer input; transparent-pixel
-click-through is not implemented. The dragged position is not saved between
-runs. Milo has no sprites, animation, tracking, configuration, or other
-companion behavior yet.
+click-through is not implemented. Milo has no sprites, animation, persistence,
+tracking, or other companion behavior yet.
