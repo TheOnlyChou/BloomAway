@@ -80,6 +80,26 @@ frame and replaces its GLib one-shot timeout. A single `GtkPicture` displays
 every state at 128 × 128 logical pixels with aspect-preserving smooth scaling,
 so neither the picture nor the window changes size during a switch.
 
+## Automatic idle behavior
+
+Milo opens a small, dedicated Wayland connection and requests an
+`ext-idle-notify-v1` notification for the current seat. The development idle
+timeout is 10 seconds. When Hyprland sends `Idled`, Milo switches to Sleeping;
+when it sends `Resumed`, Milo switches to Curious and a GLib timeout returns it
+to Idle after 3 seconds.
+
+The Wayland connection blocks efficiently on its own listener thread. That
+thread sends only `Idled` and `Resumed` values through a channel. A task on the
+GLib main context receives them and performs every animation and GTK update on
+the GTK thread. No mouse coordinates, input devices, `hyprctl` calls, or GTK
+objects are polled from the listener.
+
+Right-click remains a manual development override. It cancels a pending
+Curious-to-Idle transition and cycles the current state. The next genuine
+Wayland idle or resume event returns control to the automatic behavior. If the
+compositor does not expose `ext-idle-notify-v1`, Milo prints a diagnostic and
+continues running with its Idle animation and right-click switching.
+
 ## How dragging works
 
 `GtkApplicationWindow` creates a normal `GdkSurface` that implements the

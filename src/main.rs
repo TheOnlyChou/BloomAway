@@ -1,6 +1,8 @@
 mod animation;
+mod behavior;
 
 use animation::MiloAnimator;
+use behavior::BehaviorController;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::sync::{
@@ -89,18 +91,19 @@ fn build_ui(app: &gtk::Application) {
     window.add_css_class("milo-window");
 
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
+    let behavior = BehaviorController::new(animator);
+    behavior.start_idle_monitor();
     setup_native_drag(&window);
-    setup_debug_state_switch(&window, animator);
+    setup_debug_state_switch(&window, behavior);
 
     window.present();
 }
 
-fn setup_debug_state_switch(window: &gtk::ApplicationWindow, animator: MiloAnimator) {
+fn setup_debug_state_switch(window: &gtk::ApplicationWindow, behavior: BehaviorController) {
     let click = gtk::GestureClick::new();
     click.set_button(3);
     click.connect_pressed(move |_, _, _, _| {
-        let next_state = animator.state().next();
-        animator.set_state(next_state);
+        let next_state = behavior.cycle_debug_state();
         eprintln!("Milo state: {next_state:?}");
     });
 
