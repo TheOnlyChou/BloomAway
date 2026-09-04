@@ -1,6 +1,8 @@
+mod activity;
 mod animation;
 mod behavior;
 
+use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
 use behavior::BehaviorController;
 use gtk::prelude::*;
@@ -93,6 +95,10 @@ fn build_ui(app: &gtk::Application) {
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
     let behavior = BehaviorController::new(animator);
     behavior.start_idle_monitor();
+    start_hyprland_activity_monitor(APPLICATION_ID, |window, category| {
+        eprintln!("[milo] active window: {} | {}", window.class, window.title);
+        eprintln!("[milo] activity: {category}");
+    });
     setup_native_drag(&window);
     setup_debug_state_switch(&window, behavior);
 

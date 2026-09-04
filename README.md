@@ -71,6 +71,14 @@ Drag Milo with the left mouse button. For development, right-click Milo to
 cycle through Idle, Sleeping, Curious, and back to Idle. The selected state is
 printed in the launching terminal. Press Ctrl+C there to quit.
 
+While Milo is running, focus different application windows to inspect their
+Hyprland classes and activity categories:
+
+```text
+[milo] active window: firefox | ChatGPT — Mozilla Firefox
+[milo] activity: Browser
+```
+
 ## Animation states
 
 All four transparent PNG frames for each state under `assets/milo/` are loaded
@@ -100,6 +108,32 @@ Wayland idle or resume event returns control to the automatic behavior. If the
 compositor does not expose `ext-idle-notify-v1`, Milo prints a diagnostic and
 continues running with its Idle animation and right-click switching.
 
+## Active application observation
+
+Milo connects directly to Hyprland's newline-delimited event socket at
+`$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock`. A dedicated
+thread blocks on the socket and forwards only parsed `activewindow` events to a
+task on the GLib main context. The event payload is split at its first comma,
+so later commas remain part of the title.
+
+Application identity comes from the event's window class, not its title.
+Firefox, Google Chrome, and Chromium are classified as Browser; Code and
+Code OSS as Development; kitty and Alacritty as Terminal; Steam as Gaming;
+Spotify as Media; and unmatched classes as Other. Matching is
+case-insensitive. The terminal output always includes the actual class emitted
+by Hyprland, making new mappings easy to verify before adding them.
+
+Events for `com.milo.desktop` and empty classes are ignored, and the last
+non-Milo window remains the meaningful activity context. Identical consecutive
+window events are also ignored. Active application observation does not change
+Milo's animation state, so Sleeping and the existing resume reaction retain
+their current behavior.
+
+If the event socket is unavailable at startup, Milo reports that activity
+tracking is unavailable and continues normally. If an established connection
+drops, the listener retries the same socket every two seconds without polling
+active-window state.
+
 ## How dragging works
 
 `GtkApplicationWindow` creates a normal `GdkSurface` that implements the
@@ -111,5 +145,5 @@ movement until release. Milo contains no pointer-motion loop, coordinate
 calculation, layer-shell margins, or `hyprctl` movement commands.
 
 The transparent surface still receives pointer input; transparent-pixel
-click-through is not implemented. Milo has no persistence, tracking, movement,
-or other companion behavior yet.
+click-through is not implemented. Milo has no persistence, browser URL
+tracking, productivity scoring, blocking, or automated movement behavior.

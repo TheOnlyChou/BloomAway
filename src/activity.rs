@@ -1,0 +1,256 @@
+use futures_channel::mpsc::{UnboundedSender, unbounded};
+use futures_util::StreamExt;
+use gtk4::glib;
+use std::env;
+use std::fmt;
+use std::io::{self, BufRead, BufReader};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+const ACTIVE_WINDOW_PREFIX: &str = "activewindow>>";
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveWindow {
+    pub class: String,
+    pub title: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivityCategory {
+    Browser,
+    Development,
+    Terminal,
+    Gaming,
+    Media,
+    Other,
+}
+
+impl fmt::Display for ActivityCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+pub fn classify_window(window: &ActiveWindow) -> ActivityCategory {
+    match window.class.trim().to_ascii_lowercase().as_str() {
+        "firefox" | "google-chrome" | "chromium" => ActivityCategory::Browser,
+        "code" | "code-oss" => ActivityCategory::Development,
+        "kitty" | "alacritty" => ActivityCategory::Terminal,
+        "steam" => ActivityCategory::Gaming,
+        "spotify" => ActivityCategory::Media,
+        _ => ActivityCategory::Other,
+    }
+}
+
+pub fn start_hyprland_activity_monitor<F>(milo_class: &str, mut on_change: F)
+where
+    F: FnMut(&ActiveWindow, ActivityCategory) + 'static,
+{
+    let (sender, mut receiver) = unbounded();
+    let mut context = ActivityContext::new(milo_class);
+
+    glib::MainContext::default().spawn_local(async move {
+        while let Some(window) = receiver.next().await {
+            if let Some(category) = context.observe(window) {
+                let window = context
+                    .current()
+                    .expect("a reported activity always has a current window");
+                on_change(window, category);
+            }
+        }
+    });
+
+    if let Err(error) = thread::Builder::new()
+        .name("milo-hyprland-activity".into())
+        .spawn(move || {
+            if let Err(error) = run_hyprland_listener(sender) {
+                eprintln!("[milo] Hyprland activity tracking unavailable: {error}");
+            }
+        })
+    {
+        eprintln!(
+            "[milo] Hyprland activity tracking unavailable: failed to start listener: {error}"
+        );
+    }
+}
+
+struct ActivityContext {
+    milo_class: String,
+    current: Option<ActiveWindow>,
+}
+
+impl ActivityContext {
+    fn new(milo_class: &str) -> Self {
+        Self {
+            milo_class: milo_class.to_ascii_lowercase(),
+            current: None,
+        }
+    }
+
+    fn observe(&mut self, window: ActiveWindow) -> Option<ActivityCategory> {
+        if window.class.trim().is_empty()
+            || window.class.trim().eq_ignore_ascii_case(&self.milo_class)
+            || self.current.as_ref() == Some(&window)
+        {
+            return None;
+        }
+
+        let category = classify_window(&window);
+        self.current = Some(window);
+        Some(category)
+    }
+
+    fn current(&self) -> Option<&ActiveWindow> {
+        self.current.as_ref()
+    }
+}
+
+fn run_hyprland_listener(sender: UnboundedSender<ActiveWindow>) -> Result<(), String> {
+    let socket_path = hyprland_event_socket_path()?;
+    let first_stream = UnixStream::connect(&socket_path)
+        .map_err(|error| format!("could not open {}: {error}", socket_path.to_string_lossy()))?;
+
+    let mut stream = first_stream;
+    loop {
+        match forward_events(stream, &sender) {
+            Ok(ListenerExit::ReceiverClosed) => return Ok(()),
+            Ok(ListenerExit::Disconnected) => {
+                eprintln!("[milo] Hyprland activity socket disconnected; reconnecting");
+            }
+            Err(error) => {
+                eprintln!("[milo] Hyprland activity socket error: {error}; reconnecting");
+            }
+        }
+
+        loop {
+            thread::sleep(RECONNECT_DELAY);
+            match UnixStream::connect(&socket_path) {
+                Ok(new_stream) => {
+                    stream = new_stream;
+                    eprintln!("[milo] Hyprland activity tracking reconnected");
+                    break;
+                }
+                Err(_) if sender.is_closed() => return Ok(()),
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+fn hyprland_event_socket_path() -> Result<PathBuf, String> {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "XDG_RUNTIME_DIR is missing".to_owned())?;
+    let instance_signature = env::var_os("HYPRLAND_INSTANCE_SIGNATURE")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "HYPRLAND_INSTANCE_SIGNATURE is missing".to_owned())?;
+
+    Ok(PathBuf::from(runtime_dir)
+        .join("hypr")
+        .join(instance_signature)
+        .join(".socket2.sock"))
+}
+
+enum ListenerExit {
+    Disconnected,
+    ReceiverClosed,
+}
+
+fn forward_events(
+    stream: UnixStream,
+    sender: &UnboundedSender<ActiveWindow>,
+) -> io::Result<ListenerExit> {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = line?;
+        let Some(window) = parse_active_window_event(&line) else {
+            continue;
+        };
+
+        if sender.unbounded_send(window).is_err() {
+            return Ok(ListenerExit::ReceiverClosed);
+        }
+    }
+
+    Ok(ListenerExit::Disconnected)
+}
+
+fn parse_active_window_event(event: &str) -> Option<ActiveWindow> {
+    let payload = event.strip_prefix(ACTIVE_WINDOW_PREFIX)?;
+    let (class, title) = payload.split_once(',')?;
+
+    Some(ActiveWindow {
+        class: class.to_owned(),
+        title: title.to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_title_with_commas() {
+        assert_eq!(
+            parse_active_window_event("activewindow>>firefox,One, two, three"),
+            Some(ActiveWindow {
+                class: "firefox".to_owned(),
+                title: "One, two, three".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_and_malformed_events() {
+        assert_eq!(parse_active_window_event("workspace>>2"), None);
+        assert_eq!(parse_active_window_event("activewindow>>firefox"), None);
+    }
+
+    #[test]
+    fn classifies_classes_case_insensitively() {
+        let window = ActiveWindow {
+            class: "FiReFoX".to_owned(),
+            title: String::new(),
+        };
+
+        assert_eq!(classify_window(&window), ActivityCategory::Browser);
+    }
+
+    #[test]
+    fn retains_last_meaningful_window_when_milo_is_focused() {
+        let mut context = ActivityContext::new("com.milo.desktop");
+        let kitty = ActiveWindow {
+            class: "kitty".to_owned(),
+            title: "project".to_owned(),
+        };
+        let milo = ActiveWindow {
+            class: "COM.MILO.DESKTOP".to_owned(),
+            title: "Milo".to_owned(),
+        };
+
+        assert_eq!(
+            context.observe(kitty.clone()),
+            Some(ActivityCategory::Terminal)
+        );
+        assert_eq!(context.observe(milo), None);
+        assert_eq!(context.current(), Some(&kitty));
+    }
+
+    #[test]
+    fn does_not_report_an_unchanged_window_twice() {
+        let mut context = ActivityContext::new("com.milo.desktop");
+        let window = ActiveWindow {
+            class: "code".to_owned(),
+            title: "Milo".to_owned(),
+        };
+
+        assert_eq!(
+            context.observe(window.clone()),
+            Some(ActivityCategory::Development)
+        );
+        assert_eq!(context.observe(window), None);
+    }
+}
