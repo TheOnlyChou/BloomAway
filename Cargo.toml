@@ -1,0 +1,9 @@
+[package]
+name = "milo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc = "3.5.2"
+gtk4 = "0.11.4"
+gtk4-layer-shell = "0.8.1"
