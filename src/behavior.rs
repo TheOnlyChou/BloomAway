@@ -1,9 +1,10 @@
 use crate::activity::ActivityCategory;
 use crate::animation::{MiloAnimator, MiloState};
+use crate::distraction::{DistractionEvent, FIRST_THRESHOLD_SECONDS, SECOND_THRESHOLD_SECONDS};
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gtk4::glib;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::error::Error;
 use std::rc::Rc;
 use std::time::Duration;
@@ -15,7 +16,7 @@ use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
 
-pub const IDLE_TIMEOUT_SECONDS: u32 = 10;
+pub const DEVELOPMENT_IDLE_TIMEOUT_SECONDS: u32 = 60;
 pub const CURIOUS_AFTER_RESUME_MS: u64 = 3_000;
 pub const APP_SWITCH_CURIOUS_MS: u64 = 1_500;
 
@@ -31,11 +32,162 @@ enum CuriousReaction {
     AppSwitch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DistractionSeverity {
+    None,
+    Active,
+    Curious,
+    Concerned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StateTransition {
+    previous: MiloState,
+    current: MiloState,
+}
+
+struct BehaviorState {
+    system_idle: bool,
+    curious_reaction: Option<CuriousReaction>,
+    reaction_generation: u64,
+    distraction_severity: DistractionSeverity,
+    current: MiloState,
+}
+
+impl BehaviorState {
+    fn new() -> Self {
+        Self {
+            system_idle: false,
+            curious_reaction: None,
+            reaction_generation: 0,
+            distraction_severity: DistractionSeverity::None,
+            current: MiloState::Idle,
+        }
+    }
+
+    fn system_idle(&mut self) -> Option<StateTransition> {
+        self.invalidate_temporary_reaction();
+        self.system_idle = true;
+        self.transition_to_automatic_state()
+    }
+
+    fn resume(&mut self) -> (u64, Option<StateTransition>) {
+        self.invalidate_temporary_reaction();
+        self.system_idle = false;
+        self.curious_reaction = Some(CuriousReaction::Resume);
+        (
+            self.reaction_generation,
+            self.transition_to_automatic_state(),
+        )
+    }
+
+    fn start_app_switch_reaction(&mut self) -> (u64, Option<StateTransition>) {
+        self.invalidate_temporary_reaction();
+        self.curious_reaction = Some(CuriousReaction::AppSwitch);
+        (
+            self.reaction_generation,
+            self.transition_to_automatic_state(),
+        )
+    }
+
+    fn finish_temporary_reaction(&mut self, generation: u64) -> Option<StateTransition> {
+        if self.reaction_generation != generation {
+            return None;
+        }
+
+        self.curious_reaction = None;
+        self.transition_to_automatic_state()
+    }
+
+    fn handle_distraction_event(&mut self, event: DistractionEvent) -> Option<StateTransition> {
+        if self.curious_reaction == Some(CuriousReaction::AppSwitch) {
+            self.invalidate_temporary_reaction();
+        }
+
+        match event {
+            DistractionEvent::Started(_) => {
+                self.distraction_severity = DistractionSeverity::Active;
+            }
+            DistractionEvent::Threshold { seconds, .. } if seconds == FIRST_THRESHOLD_SECONDS => {
+                self.distraction_severity = DistractionSeverity::Curious;
+            }
+            DistractionEvent::Threshold { seconds, .. } if seconds == SECOND_THRESHOLD_SECONDS => {
+                self.distraction_severity = DistractionSeverity::Concerned;
+            }
+            DistractionEvent::Threshold { .. } => {}
+            DistractionEvent::Ended { .. } => {
+                self.distraction_severity = DistractionSeverity::None;
+            }
+        }
+
+        self.transition_to_automatic_state()
+    }
+
+    fn cycle_debug_state(&mut self) -> StateTransition {
+        self.invalidate_temporary_reaction();
+        let previous = self.current;
+        self.current = self.current.next();
+        StateTransition {
+            previous,
+            current: self.current,
+        }
+    }
+
+    fn app_switch_reaction_allowed(&self) -> bool {
+        !self.system_idle
+            && self.curious_reaction != Some(CuriousReaction::Resume)
+            && self.distraction_severity == DistractionSeverity::None
+    }
+
+    fn has_app_switch_reaction(&self) -> bool {
+        self.curious_reaction == Some(CuriousReaction::AppSwitch)
+    }
+
+    fn invalidate_temporary_reaction(&mut self) {
+        self.reaction_generation = self.reaction_generation.wrapping_add(1);
+        self.curious_reaction = None;
+    }
+
+    fn transition_to_automatic_state(&mut self) -> Option<StateTransition> {
+        let next = self.automatic_state();
+        if next == self.current {
+            return None;
+        }
+
+        let transition = StateTransition {
+            previous: self.current,
+            current: next,
+        };
+        self.current = next;
+        Some(transition)
+    }
+
+    fn automatic_state(&self) -> MiloState {
+        if self.system_idle {
+            return MiloState::Sleeping;
+        }
+        if self.curious_reaction == Some(CuriousReaction::Resume) {
+            return MiloState::Curious;
+        }
+
+        match self.distraction_severity {
+            DistractionSeverity::Active => MiloState::Idle,
+            DistractionSeverity::Curious => MiloState::Curious,
+            DistractionSeverity::Concerned => MiloState::Concerned,
+            DistractionSeverity::None => {
+                if self.curious_reaction == Some(CuriousReaction::AppSwitch) {
+                    MiloState::Curious
+                } else {
+                    MiloState::Idle
+                }
+            }
+        }
+    }
+}
+
 struct BehaviorInner {
     animator: MiloAnimator,
-    system_idle: Cell<bool>,
-    curious_reaction: Cell<Option<CuriousReaction>>,
-    reaction_generation: Cell<u64>,
+    state: RefCell<BehaviorState>,
     curious_timeout: RefCell<Option<glib::SourceId>>,
 }
 
@@ -49,9 +201,7 @@ impl BehaviorController {
         Self {
             inner: Rc::new(BehaviorInner {
                 animator,
-                system_idle: Cell::new(false),
-                curious_reaction: Cell::new(None),
-                reaction_generation: Cell::new(0),
+                state: RefCell::new(BehaviorState::new()),
                 curious_timeout: RefCell::new(None),
             }),
         }
@@ -86,19 +236,14 @@ impl BehaviorController {
     }
 
     pub fn cycle_debug_state(&self) -> MiloState {
-        self.cancel_curious_timeout();
-        let next_state = self.inner.animator.state().next();
-        self.inner.animator.set_state(next_state);
-        next_state
+        self.clear_curious_timeout();
+        let transition = self.inner.state.borrow_mut().cycle_debug_state();
+        self.apply_transition(Some(transition));
+        transition.current
     }
 
     pub fn handle_category_change(&self, previous: ActivityCategory, current: ActivityCategory) {
-        if previous == current
-            || !app_switch_reaction_allowed(
-                self.inner.system_idle.get(),
-                self.inner.curious_reaction.get(),
-            )
-        {
+        if previous == current || !self.inner.state.borrow().app_switch_reaction_allowed() {
             return;
         }
 
@@ -107,16 +252,33 @@ impl BehaviorController {
         self.start_curious_reaction(CuriousReaction::AppSwitch, APP_SWITCH_CURIOUS_MS);
     }
 
+    pub fn handle_distraction_event(&self, event: DistractionEvent) {
+        if self.inner.state.borrow().has_app_switch_reaction() {
+            self.clear_curious_timeout();
+        }
+        let transition = self
+            .inner
+            .state
+            .borrow_mut()
+            .handle_distraction_event(event);
+        if let Some(transition) = transition {
+            eprintln!(
+                "[milo] distraction state: {:?} -> {:?}",
+                transition.previous, transition.current
+            );
+        }
+        self.apply_transition(transition);
+    }
+
     fn handle_activity_event(&self, event: ActivityEvent) {
+        self.clear_curious_timeout();
         match event {
             ActivityEvent::Idled => {
-                self.inner.system_idle.set(true);
-                self.cancel_curious_timeout();
-                self.inner.animator.set_state(MiloState::Sleeping);
+                let transition = self.inner.state.borrow_mut().system_idle();
+                self.apply_transition(transition);
                 eprintln!("Milo automatic state: Sleeping (user idle)");
             }
             ActivityEvent::Resumed => {
-                self.inner.system_idle.set(false);
                 eprintln!("Milo automatic state: Curious (user resumed)");
                 self.start_curious_reaction(CuriousReaction::Resume, CURIOUS_AFTER_RESUME_MS);
             }
@@ -124,50 +286,47 @@ impl BehaviorController {
     }
 
     fn start_curious_reaction(&self, reaction: CuriousReaction, duration_ms: u64) {
-        self.cancel_curious_timeout();
-        self.inner.curious_reaction.set(Some(reaction));
-        self.inner.animator.set_state(MiloState::Curious);
+        self.clear_curious_timeout();
+        let (generation, transition) = match reaction {
+            CuriousReaction::Resume => self.inner.state.borrow_mut().resume(),
+            CuriousReaction::AppSwitch => self.inner.state.borrow_mut().start_app_switch_reaction(),
+        };
+        self.apply_transition(transition);
 
-        let generation = self.inner.reaction_generation.get();
         let weak_inner = Rc::downgrade(&self.inner);
         let timeout = glib::timeout_add_local_once(Duration::from_millis(duration_ms), move || {
             let Some(inner) = weak_inner.upgrade() else {
                 return;
             };
-            if inner.reaction_generation.get() != generation {
-                return;
-            }
-
             inner.curious_timeout.borrow_mut().take();
-            inner.curious_reaction.set(None);
-            if inner.system_idle.get() {
-                inner.animator.set_state(MiloState::Sleeping);
-            } else {
-                inner.animator.set_state(MiloState::Idle);
+            let transition = inner
+                .state
+                .borrow_mut()
+                .finish_temporary_reaction(generation);
+            if let Some(transition) = transition {
+                inner.animator.set_state(transition.current);
                 if reaction == CuriousReaction::Resume {
-                    eprintln!("Milo automatic state: Idle (resume reaction complete)");
+                    eprintln!(
+                        "Milo automatic state: {:?} (resume reaction complete)",
+                        transition.current
+                    );
                 }
             }
         });
         self.inner.curious_timeout.replace(Some(timeout));
     }
 
-    fn cancel_curious_timeout(&self) {
-        self.inner
-            .reaction_generation
-            .set(self.inner.reaction_generation.get().wrapping_add(1));
-        self.inner.curious_reaction.set(None);
+    fn clear_curious_timeout(&self) {
         if let Some(timeout) = self.inner.curious_timeout.borrow_mut().take() {
             timeout.remove();
         }
     }
-}
 
-fn app_switch_reaction_allowed(
-    system_idle: bool,
-    current_reaction: Option<CuriousReaction>,
-) -> bool {
-    !system_idle && current_reaction != Some(CuriousReaction::Resume)
+    fn apply_transition(&self, transition: Option<StateTransition>) {
+        if let Some(transition) = transition {
+            self.inner.animator.set_state(transition.current);
+        }
+    }
 }
 
 struct IdleListenerState {
@@ -227,7 +386,7 @@ fn run_idle_listener(
         .bind::<ExtIdleNotifierV1, _, _>(&queue_handle, 1..=2, ())
         .map_err(|error| format!("ext-idle-notify-v1 is not supported: {error}"))?;
 
-    let timeout_ms = IDLE_TIMEOUT_SECONDS * 1_000;
+    let timeout_ms = DEVELOPMENT_IDLE_TIMEOUT_SECONDS * 1_000;
     let _notification = if notifier.version() >= 2 {
         notifier.get_input_idle_notification(timeout_ms, &seat, &queue_handle, ())
     } else {
@@ -250,17 +409,146 @@ fn run_idle_listener(
 mod tests {
     use super::*;
 
+    fn started() -> DistractionEvent {
+        DistractionEvent::Started(crate::distraction::DistractionKind::YouTubeShorts)
+    }
+
+    fn threshold(seconds: u64) -> DistractionEvent {
+        DistractionEvent::Threshold {
+            kind: crate::distraction::DistractionKind::YouTubeShorts,
+            seconds,
+        }
+    }
+
+    fn ended() -> DistractionEvent {
+        DistractionEvent::Ended {
+            kind: crate::distraction::DistractionKind::YouTubeShorts,
+            elapsed: Duration::from_secs(21),
+        }
+    }
+
     #[test]
-    fn sleeping_and_resume_reactions_have_priority_over_app_switches() {
-        assert!(!app_switch_reaction_allowed(true, None));
-        assert!(!app_switch_reaction_allowed(
-            false,
-            Some(CuriousReaction::Resume)
+    fn distraction_severity_progresses_and_thirty_seconds_stays_concerned() {
+        let mut state = BehaviorState::new();
+
+        assert_eq!(state.handle_distraction_event(started()), None);
+        assert_eq!(state.current, MiloState::Idle);
+        assert_eq!(
+            state.handle_distraction_event(threshold(FIRST_THRESHOLD_SECONDS)),
+            Some(StateTransition {
+                previous: MiloState::Idle,
+                current: MiloState::Curious,
+            })
+        );
+        assert_eq!(
+            state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS)),
+            Some(StateTransition {
+                previous: MiloState::Curious,
+                current: MiloState::Concerned,
+            })
+        );
+        assert_eq!(
+            state.handle_distraction_event(threshold(crate::distraction::THIRD_THRESHOLD_SECONDS)),
+            None
+        );
+        assert_eq!(state.current, MiloState::Concerned);
+    }
+
+    #[test]
+    fn ending_sessions_returns_curious_or_concerned_to_idle() {
+        for final_threshold in [FIRST_THRESHOLD_SECONDS, SECOND_THRESHOLD_SECONDS] {
+            let mut state = BehaviorState::new();
+            state.handle_distraction_event(started());
+            state.handle_distraction_event(threshold(final_threshold));
+
+            assert_eq!(
+                state.handle_distraction_event(ended()).unwrap().current,
+                MiloState::Idle
+            );
+        }
+    }
+
+    #[test]
+    fn system_idle_overrides_concerned() {
+        let mut state = BehaviorState::new();
+        state.handle_distraction_event(started());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+
+        assert_eq!(state.system_idle().unwrap().current, MiloState::Sleeping);
+    }
+
+    #[test]
+    fn resume_after_sleeping_is_temporarily_curious_then_idle() {
+        let mut state = BehaviorState::new();
+        state.system_idle();
+
+        let (generation, resumed) = state.resume();
+        assert_eq!(resumed.unwrap().current, MiloState::Curious);
+        assert_eq!(
+            state.finish_temporary_reaction(generation).unwrap().current,
+            MiloState::Idle
+        );
+    }
+
+    #[test]
+    fn new_session_after_concerned_restarts_at_idle() {
+        let mut state = BehaviorState::new();
+        state.handle_distraction_event(started());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+        state.handle_distraction_event(ended());
+
+        assert_eq!(state.handle_distraction_event(started()), None);
+        assert_eq!(state.current, MiloState::Idle);
+        assert_eq!(state.distraction_severity, DistractionSeverity::Active);
+    }
+
+    #[test]
+    fn switching_distraction_kind_resets_severity() {
+        let mut state = BehaviorState::new();
+        state.handle_distraction_event(started());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+        state.handle_distraction_event(ended());
+        let transition = state.handle_distraction_event(DistractionEvent::Started(
+            crate::distraction::DistractionKind::InstagramReels,
         ));
-        assert!(app_switch_reaction_allowed(false, None));
-        assert!(app_switch_reaction_allowed(
-            false,
-            Some(CuriousReaction::AppSwitch)
-        ));
+
+        assert_eq!(transition, None);
+        assert_eq!(state.current, MiloState::Idle);
+        assert_eq!(state.distraction_severity, DistractionSeverity::Active);
+    }
+
+    #[test]
+    fn stale_temporary_timer_cannot_overwrite_concerned() {
+        let mut state = BehaviorState::new();
+        let (generation, _) = state.start_app_switch_reaction();
+        state.handle_distraction_event(started());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+
+        assert_eq!(state.finish_temporary_reaction(generation), None);
+        assert_eq!(state.current, MiloState::Concerned);
+    }
+
+    #[test]
+    fn completing_resume_reaction_uses_persistent_distraction_state() {
+        let mut state = BehaviorState::new();
+        state.system_idle();
+        let (generation, _) = state.resume();
+        state.handle_distraction_event(started());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+
+        assert_eq!(
+            state.finish_temporary_reaction(generation).unwrap().current,
+            MiloState::Concerned
+        );
+    }
+
+    #[test]
+    fn app_switch_reactions_do_not_override_distraction_severity() {
+        let mut state = BehaviorState::new();
+        state.handle_distraction_event(started());
+
+        assert!(!state.app_switch_reaction_allowed());
+        state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+        assert!(!state.app_switch_reaction_allowed());
     }
 }

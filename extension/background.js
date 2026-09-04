@@ -29,6 +29,7 @@ function connectNativeHost() {
   try {
     const port = browser.runtime.connectNative(NATIVE_HOST_NAME);
     nativePort = port;
+    console.log("[milo-extension] native host connected");
     port.onDisconnect.addListener(() => {
       if (nativePort === port) {
         nativePort = null;
@@ -54,9 +55,6 @@ function sendActivity(activity) {
       activity: NativeActivity[activity],
     });
   } catch (error) {
-    if (nativePort === port) {
-      nativePort = null;
-    }
     console.warn("[milo-extension] could not send browser activity", error);
   }
 }

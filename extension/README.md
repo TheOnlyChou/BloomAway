@@ -76,6 +76,19 @@ The extension keeps one persistent
 `runtime.connectNative("com.milo.desktop")` port. On disconnect it clears the
 port; a later category transition makes one new connection attempt. There is
 no retry timer, and a missing host or stopped Milo cannot interrupt browsing.
+The module-level port is reused for every category transition and is cleared
+only by its `onDisconnect` callback. The background console logs
+`[milo-extension] native host connected` when the port is created and logs
+`[milo-extension] native host disconnected` only when Firefox reports that
+connection ending.
+
+The helper independently retains one Unix stream to the running Milo process.
+If that local stream cannot be opened or written, the helper reports the error
+to stderr, keeps reading Firefox Native Messaging frames, and tries Milo again
+on a later activity message. Local socket failure therefore does not tear down
+the extension port. Firefox stdin EOF (or an unusable Native Messaging frame)
+ends the helper and sends an explicit tracking-unavailable message to Milo when
+the local connection is available.
 
 Only messages with this shape cross Native Messaging:
 
@@ -106,18 +119,42 @@ URLs become `Other`.
 
 2. Start Milo with `cargo run`.
 3. Load or reload `extension/manifest.json` through `about:debugging`.
-4. Open normal YouTube. Expected Milo output:
+4. In the extension background console, expect this once:
+
+   ```text
+   [milo-extension] native host connected
+   ```
+
+5. Open normal YouTube. Expected Milo output:
 
    ```text
    [milo] browser activity: YouTube
    ```
 
-5. Open YouTube Shorts. Expected: `[milo] browser activity: YouTubeShorts`.
-6. Open Instagram. Expected: `[milo] browser activity: Instagram`.
-7. Open Reels. Expected: `[milo] browser activity: InstagramReels`.
-8. Open another site to verify `Other` if desired.
-9. Stop Milo and continue browsing. Firefox pages must continue working; the
-   extension console may report a native-host disconnect.
+6. Open YouTube Shorts. Expect
+   `[milo] browser activity: YouTubeShorts`, followed by one continuous session:
+
+   ```text
+   [milo] distraction started: YouTubeShorts
+   [milo] distraction 10s: YouTubeShorts
+   [milo] distraction 20s: YouTubeShorts
+   [milo] distraction 30s: YouTubeShorts
+   [milo] intervention requested: StillScrolling
+   [milo] intervention presentation: Show
+   [milo] GTK: calling intervention popover.popup()
+   ```
+
+   There must be no immediate `native host disconnected` message. Milo should
+   progress Idle -> Curious -> Concerned -> intervention popup over 35 seconds.
+7. Open normal YouTube. The same native-host port remains connected, the
+   browser category changes, and the distraction session ends normally.
+8. Open Instagram. Expected: `[milo] browser activity: Instagram`.
+9. Open Reels. Expected: `[milo] browser activity: InstagramReels`.
+10. Stop Milo and continue browsing. Firefox pages and the native-host port
+    must remain unaffected; a later category transition may produce only a
+    local Milo-socket diagnostic from the helper.
+11. Reload the extension or close Firefox. That genuine Native Messaging
+    closure may produce `[milo-extension] native host disconnected`.
 
 ## Classification test cases
 

@@ -29,6 +29,15 @@ pub struct BrowserActivityMessage {
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum LocalBrowserMessage {
+    #[serde(rename = "browser_activity")]
+    Activity { activity: BrowserActivity },
+    #[serde(rename = "browser_tracking_unavailable")]
+    TrackingUnavailable,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum BrowserMessageType {
     #[serde(rename = "browser_activity")]
     BrowserActivity,
@@ -97,14 +106,20 @@ pub fn write_local_message<W: Write>(
     writer: &mut W,
     message: &BrowserActivityMessage,
 ) -> io::Result<()> {
+    write_local_json(writer, message)
+}
+
+pub fn write_local_tracking_unavailable<W: Write>(writer: &mut W) -> io::Result<()> {
+    write_local_json(writer, &LocalBrowserMessage::TrackingUnavailable)
+}
+
+fn write_local_json<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, message).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
 
-pub fn read_local_message<R: BufRead>(
-    reader: &mut R,
-) -> io::Result<Option<BrowserActivityMessage>> {
+pub fn read_local_message<R: BufRead>(reader: &mut R) -> io::Result<Option<LocalBrowserMessage>> {
     let mut payload = Vec::new();
     let byte_count = reader
         .take((MAX_LOCAL_MESSAGE_SIZE + 1) as u64)
@@ -126,7 +141,7 @@ pub fn read_local_message<R: BufRead>(
     }
     payload.pop();
 
-    decode_browser_message(&payload)
+    serde_json::from_slice(&payload)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
@@ -186,6 +201,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_multiple_native_messages_until_eof() {
+        let payloads = [
+            br#"{"type":"browser_activity","activity":"youtube"}"#.as_slice(),
+            br#"{"type":"browser_activity","activity":"youtube_shorts"}"#.as_slice(),
+            br#"{"type":"browser_activity","activity":"instagram_reels"}"#.as_slice(),
+        ];
+        let mut framed = Vec::new();
+        for payload in payloads {
+            write_native_message(&mut framed, payload).unwrap();
+        }
+
+        let mut input = Cursor::new(framed);
+        for payload in payloads {
+            assert_eq!(
+                read_native_message(&mut input).unwrap(),
+                Some(payload.to_vec())
+            );
+        }
+        assert_eq!(read_native_message(&mut input).unwrap(), None);
+    }
+
+    #[test]
     fn native_eof_is_clean() {
         assert_eq!(
             read_native_message(&mut Cursor::new(Vec::new())).unwrap(),
@@ -211,6 +248,22 @@ mod tests {
         let decoded = read_local_message(&mut BufReader::new(Cursor::new(encoded)))
             .unwrap()
             .unwrap();
-        assert_eq!(decoded, message);
+        assert_eq!(
+            decoded,
+            LocalBrowserMessage::Activity {
+                activity: BrowserActivity::InstagramReels
+            }
+        );
+    }
+
+    #[test]
+    fn local_protocol_carries_tracking_unavailable_explicitly() {
+        let mut encoded = Vec::new();
+        write_local_tracking_unavailable(&mut encoded).unwrap();
+
+        let decoded = read_local_message(&mut BufReader::new(Cursor::new(encoded)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded, LocalBrowserMessage::TrackingUnavailable);
     }
 }

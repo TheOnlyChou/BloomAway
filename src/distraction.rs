@@ -29,8 +29,8 @@ struct DistractionSession {
     next_threshold: usize,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-enum DistractionEvent {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DistractionEvent {
     Started(DistractionKind),
     Threshold {
         kind: DistractionKind,
@@ -149,12 +149,19 @@ impl DistractionTracker {
 #[derive(Clone)]
 pub struct DistractionController {
     tracker: Rc<RefCell<DistractionTracker>>,
+    event_handler: DistractionEventHandler,
 }
 
+type DistractionEventHandler = Rc<RefCell<Box<dyn FnMut(DistractionEvent)>>>;
+
 impl DistractionController {
-    pub fn new() -> Self {
+    pub fn new<F>(event_handler: F) -> Self
+    where
+        F: FnMut(DistractionEvent) + 'static,
+    {
         Self {
             tracker: Rc::new(RefCell::new(DistractionTracker::new())),
+            event_handler: Rc::new(RefCell::new(Box::new(event_handler))),
         }
     }
 
@@ -205,7 +212,7 @@ impl DistractionController {
 
     fn handle_events(&self, events: Vec<DistractionEvent>) {
         for event in events {
-            match event {
+            match &event {
                 DistractionEvent::Started(kind) => {
                     eprintln!("[milo] distraction started: {kind:?}");
                 }
@@ -219,6 +226,7 @@ impl DistractionController {
                     );
                 }
             }
+            (self.event_handler.borrow_mut())(event);
         }
     }
 }

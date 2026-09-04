@@ -1,9 +1,11 @@
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gtk4::glib;
-use milo::browser::{BrowserActivity, browser_socket_path, read_local_message};
+use milo::browser::{
+    BrowserActivity, LocalBrowserMessage, browser_socket_path, read_local_message,
+};
 use std::fs;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -48,12 +50,6 @@ fn run_browser_listener(sender: UnboundedSender<BrowserActivityEvent>) -> io::Re
             Ok(stream) => {
                 if let Err(error) = forward_browser_messages(stream, &sender) {
                     eprintln!("[milo] browser connection closed: {error}");
-                }
-                if sender
-                    .unbounded_send(BrowserActivityEvent::Unavailable)
-                    .is_err()
-                {
-                    return Ok(());
                 }
             }
             Err(error) => eprintln!("[milo] could not accept browser connection: {error}"),
@@ -135,16 +131,17 @@ fn secure_listener(listener: UnixListener, socket_path: &Path) -> io::Result<Uni
     Ok(listener)
 }
 
-fn forward_browser_messages(
-    stream: UnixStream,
+fn forward_browser_messages<R: Read>(
+    stream: R,
     sender: &UnboundedSender<BrowserActivityEvent>,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     while let Some(message) = read_local_message(&mut reader)? {
-        if sender
-            .unbounded_send(BrowserActivityEvent::Activity(message.activity))
-            .is_err()
-        {
+        let event = match message {
+            LocalBrowserMessage::Activity { activity } => BrowserActivityEvent::Activity(activity),
+            LocalBrowserMessage::TrackingUnavailable => BrowserActivityEvent::Unavailable,
+        };
+        if sender.unbounded_send(event).is_err() {
             return Ok(());
         }
     }
@@ -155,6 +152,46 @@ fn forward_browser_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use milo::browser::{
+        BrowserActivityMessage, write_local_message, write_local_tracking_unavailable,
+    };
+    use std::io::Cursor;
+
+    #[test]
+    fn local_stream_eof_does_not_mean_tracking_unavailable() {
+        let mut encoded = Vec::new();
+        write_local_message(
+            &mut encoded,
+            &BrowserActivityMessage::new(BrowserActivity::YouTubeShorts),
+        )
+        .unwrap();
+
+        let (sender, mut receiver) = unbounded();
+        forward_browser_messages(Cursor::new(encoded), &sender).unwrap();
+        drop(sender);
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            BrowserActivityEvent::Activity(BrowserActivity::YouTubeShorts)
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_tracking_unavailable_message_is_forwarded() {
+        let mut encoded = Vec::new();
+        write_local_tracking_unavailable(&mut encoded).unwrap();
+
+        let (sender, mut receiver) = unbounded();
+        forward_browser_messages(Cursor::new(encoded), &sender).unwrap();
+        drop(sender);
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            BrowserActivityEvent::Unavailable
+        );
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn refuses_to_replace_a_non_socket_path() {

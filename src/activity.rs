@@ -63,13 +63,13 @@ pub fn start_hyprland_activity_monitor<F, G>(
             let transition = context.observe(window);
             let current_category = context.current.as_ref().map(classify_window);
 
+            if let Some((previous, current)) = transition {
+                on_category_change(previous, current);
+            }
             if current_category != previous_category
                 && let Some(current) = current_category
             {
                 on_current_category(current);
-            }
-            if let Some((previous, current)) = transition {
-                on_category_change(previous, current);
             }
         }
     });

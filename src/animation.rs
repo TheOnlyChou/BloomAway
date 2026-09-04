@@ -26,6 +26,13 @@ const CURIOUS_FRAME_PATHS: [&str; 4] = [
     "assets/milo/curious/curious_04.png",
 ];
 
+const CONCERNED_FRAME_PATHS: [&str; 4] = [
+    "assets/milo/concerned/concerned_01.png",
+    "assets/milo/concerned/concerned_02.png",
+    "assets/milo/concerned/concerned_03.png",
+    "assets/milo/concerned/concerned_04.png",
+];
+
 #[derive(Clone, Copy)]
 struct AnimationStep {
     frame: usize,
@@ -93,12 +100,32 @@ const CURIOUS_STEPS: [AnimationStep; 4] = [
     },
 ];
 
+const CONCERNED_STEPS: [AnimationStep; 4] = [
+    AnimationStep {
+        frame: 0,
+        duration_ms: 500,
+    },
+    AnimationStep {
+        frame: 1,
+        duration_ms: 400,
+    },
+    AnimationStep {
+        frame: 2,
+        duration_ms: 650,
+    },
+    AnimationStep {
+        frame: 3,
+        duration_ms: 400,
+    },
+];
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MiloState {
     #[default]
     Idle,
     Sleeping,
     Curious,
+    Concerned,
 }
 
 impl MiloState {
@@ -106,7 +133,8 @@ impl MiloState {
         match self {
             Self::Idle => Self::Sleeping,
             Self::Sleeping => Self::Curious,
-            Self::Curious => Self::Idle,
+            Self::Curious => Self::Concerned,
+            Self::Concerned => Self::Idle,
         }
     }
 }
@@ -120,6 +148,7 @@ struct AnimationSets {
     idle: AnimationSet,
     sleeping: AnimationSet,
     curious: AnimationSet,
+    concerned: AnimationSet,
 }
 
 impl AnimationSets {
@@ -128,6 +157,7 @@ impl AnimationSets {
             idle: load_animation_set(&IDLE_FRAME_PATHS, &IDLE_STEPS)?,
             sleeping: load_animation_set(&SLEEPING_FRAME_PATHS, &SLEEPING_STEPS)?,
             curious: load_animation_set(&CURIOUS_FRAME_PATHS, &CURIOUS_STEPS)?,
+            concerned: load_animation_set(&CONCERNED_FRAME_PATHS, &CONCERNED_STEPS)?,
         })
     }
 
@@ -136,6 +166,7 @@ impl AnimationSets {
             MiloState::Idle => &self.idle,
             MiloState::Sleeping => &self.sleeping,
             MiloState::Curious => &self.curious,
+            MiloState::Concerned => &self.concerned,
         }
     }
 }
@@ -167,10 +198,6 @@ impl MiloAnimator {
 
         animator.set_state(MiloState::default());
         Ok(animator)
-    }
-
-    pub fn state(&self) -> MiloState {
-        self.inner.borrow().state
     }
 
     pub fn set_state(&self, state: MiloState) {
@@ -239,4 +266,17 @@ fn advance_frame(inner: Rc<RefCell<PlayerInner>>) {
     };
 
     schedule_next_step(inner, next_duration);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_cycle_includes_concerned() {
+        assert_eq!(MiloState::Idle.next(), MiloState::Sleeping);
+        assert_eq!(MiloState::Sleeping.next(), MiloState::Curious);
+        assert_eq!(MiloState::Curious.next(), MiloState::Concerned);
+        assert_eq!(MiloState::Concerned.next(), MiloState::Idle);
+    }
 }

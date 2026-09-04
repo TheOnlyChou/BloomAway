@@ -1,8 +1,8 @@
 # Milo
 
 Milo is a minimal native Wayland desktop companion for GTK4 and Hyprland. It
-displays illustrated Idle, Sleeping, and Curious animations in a transparent,
-undecorated, small normal Wayland toplevel window.
+displays illustrated Idle, Sleeping, Curious, and Concerned animations in a
+transparent, undecorated, small normal Wayland toplevel window.
 
 ## Native dependency
 
@@ -68,8 +68,8 @@ hyprctl clients
 ```
 
 Drag Milo with the left mouse button. For development, right-click Milo to
-cycle through Idle, Sleeping, Curious, and back to Idle. The selected state is
-printed in the launching terminal. Press Ctrl+C there to quit.
+cycle through Idle, Sleeping, Curious, Concerned, and back to Idle. The selected
+state is printed in the launching terminal. Press Ctrl+C there to quit.
 
 While Milo is running, focus applications in different activity categories to
 see the context transition and visual reaction:
@@ -88,11 +88,15 @@ frame and replaces its GLib one-shot timeout. A single `GtkPicture` displays
 every state at 128 × 128 logical pixels with aspect-preserving smooth scaling,
 so neither the picture nor the window changes size during a switch.
 
+Concerned uses the four normalized frames in `assets/milo/concerned/`, looping
+with per-frame durations of 500, 400, 650, and 400 milliseconds through the
+same animation player as the other states.
+
 ## Automatic idle behavior
 
 Milo opens a small, dedicated Wayland connection and requests an
 `ext-idle-notify-v1` notification for the current seat. The development idle
-timeout is 10 seconds. When Hyprland sends `Idled`, Milo switches to Sleeping;
+timeout is 60 seconds. When Hyprland sends `Idled`, Milo switches to Sleeping;
 when it sends `Resumed`, Milo switches to Curious and a GLib timeout returns it
 to Idle after 3 seconds.
 
@@ -162,8 +166,18 @@ Firefox launches only the small `milo-native-host` binary, never the GTK Milo
 binary. Native Messaging stdin uses a four-byte native-endian unsigned length
 followed by exactly that many UTF-8 JSON bytes. The helper rejects frames above
 64 KiB before allocating their payload, writes diagnostics only to stderr, and
-forwards valid category-only messages to the Unix socket as one JSON object per
+keeps reading framed messages until Firefox closes stdin. It retains one Unix
+socket connection to Milo; a local connection or write failure is logged and
+retried on the next browser message without ending the Firefox connection.
+Valid category-only messages cross the local socket as one JSON object per
 line. It opens no TCP ports and persists nothing.
+
+Firefox connection loss is represented explicitly on the local protocol as
+`{"type":"browser_tracking_unavailable"}`. Milo does not interpret the end of
+an individual Unix stream as browser unavailability. This keeps a temporary
+local forwarding failure separate from the lifetime of Firefox's persistent
+Native Messaging port while preserving the rule that a genuine Firefox/native
+host disconnect ends a distraction session.
 
 See [extension/README.md](extension/README.md) for the user-level Firefox host
 installation, removal, extension identity/authorization, and exact manual test
@@ -192,29 +206,93 @@ from another application or system idle likewise starts a fresh continuous
 session if the combined context still qualifies. No separated visits are
 accumulated or persisted.
 
-Distraction events currently produce logs only:
+Distraction sessions retain their existing logs and also drive persistent
+visual severity:
 
 ```text
 [milo] distraction started: YouTubeShorts
 [milo] distraction 10s: YouTubeShorts
-[milo] distraction ended: YouTubeShorts (13.4s)
+[milo] distraction state: Idle -> Curious
+[milo] distraction 20s: YouTubeShorts
+[milo] distraction state: Curious -> Concerned
+[milo] distraction 30s: YouTubeShorts
 ```
 
-They do not call `BehaviorController`, change `MiloState`, close tabs, block
-sites, or produce dialogue or scores.
+Session start maps to Idle, 10 seconds maps to persistent Curious, and 20
+seconds maps to persistent Concerned. At 30 seconds Milo remains Concerned, the
+threshold is logged, and a one-time `StillScrolling` intervention is requested.
+Ending a session returns Curious or Concerned to Idle. A direct Shorts/Reels
+kind change ends the old session and starts the new one at Idle.
+
+`BehaviorController` is the sole authority that applies states to the animator.
+Its pure state model resolves priority as system idle/Sleeping first, the
+temporary resume Curious reaction second, persistent distraction severity
+third, and normal Idle last. App-switch reactions cannot override an active
+distraction session. Temporary callbacks carry a generation token and always
+recompute the authoritative state, so an obsolete callback cannot replace
+Concerned with Idle. System idle clears the session; resume therefore ends at
+Idle rather than restoring the old Concerned state.
+
+No threshold closes tabs, blocks sites, changes pages, sends Firefox commands,
+or produces scores, story progression, or persistence.
+
+### Still-scrolling intervention
+
+The 30-second intervention is modeled independently from its GTK presentation.
+The lifecycle records whether a distraction session is active, whether that
+session has already requested its intervention, and whether the intervention
+is visible. It emits only `Show(StillScrolling)` and `Hide` presentation
+requests. The text and response labels are centralized in `intervention.rs`.
+
+GTK presents the request as a small `GtkPopover` parented to Milo's existing
+picture, above the character. It contains `Still scrolling?` plus `Take a break`
+and `Keep scrolling` buttons. Button callbacks emit the local semantic
+responses `TakeBreak` and `KeepScrolling`, dismiss the popover, and log the
+response. Neither response changes the distraction session or communicates
+with Firefox, so Milo remains Concerned until the user actually leaves the
+distracting context.
+
+The requested-this-session flag remains set after dismissal, preventing the
+same continuous session from reopening the intervention. Session end, a direct
+Shorts/Reels switch, browser disconnect, and system idle all dismiss a visible
+popover and reset eligibility. Only a new session reaching 30 seconds can show
+it again.
+
+For temporary presentation diagnostics, start Milo when no other Milo instance
+is running with:
+
+```bash
+cargo run -- --debug-intervention
+```
+
+This bypasses browser and distraction events and calls the GTK presentation
+layer after about one second. The normal 30-second path logs, in order,
+`intervention requested: StillScrolling`, `intervention presentation: Show`,
+and `GTK: calling intervention popover.popup()`. Hide presentation is also
+logged. The debug option is development-only and does not fake Firefox input or
+alter intervention eligibility.
 
 ### Manual distraction-session test
 
 1. Start Milo, load the Firefox extension, and focus YouTube Shorts. Confirm a
-   `distraction started` log.
-2. Wait about 10 seconds and confirm one `distraction 10s` log.
-3. Switch to kitty before 20 seconds and confirm the session ends with its
-   elapsed duration.
-4. Return to Firefox Shorts and confirm a new session starts from zero.
-5. Stay for 30 seconds and confirm the 10s, 20s, and 30s logs each appear once.
-6. Open normal YouTube and confirm the session ends immediately.
-7. Start another Shorts session and leave the computer idle; confirm it ends
-   when Milo enters its system-idle state.
+   new session starts while Milo remains Idle.
+2. At about 10 seconds, confirm Milo changes to persistent Curious.
+3. At about 20 seconds, confirm Milo changes to persistent Concerned.
+4. At about 30 seconds, confirm Milo remains Concerned and a popover displays
+   `Still scrolling?`, `Take a break`, and `Keep scrolling`.
+5. Choose `Keep scrolling`; confirm the response log, that the popup closes,
+   and that it does not reopen during the same session.
+6. Switch to kitty and confirm the session ends and Milo immediately returns to
+   Idle.
+7. Return to Shorts, reach 30 seconds again, and confirm the new session can
+   show the intervention.
+8. While it is visible, switch away and confirm it closes immediately.
+9. Show it in another session, become system-idle, and confirm the popup closes
+   while Milo becomes Sleeping.
+10. Resume and confirm Sleeping -> temporary Curious -> Idle; the previous
+    Concerned state and intervention must not return.
+11. Right-click repeatedly and confirm the debug cycle still includes
+    Concerned without answering the intervention.
 
 ## How dragging works
 

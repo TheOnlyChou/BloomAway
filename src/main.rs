@@ -3,6 +3,7 @@ mod animation;
 mod behavior;
 mod browser_listener;
 mod distraction;
+mod intervention;
 
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
@@ -11,6 +12,11 @@ use browser_listener::{BrowserActivityEvent, start_browser_activity_monitor};
 use distraction::DistractionController;
 use gtk::prelude::*;
 use gtk4 as gtk;
+use intervention::{
+    Intervention, InterventionController, InterventionPresentation, InterventionResponse,
+};
+use std::ffi::OsStr;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -22,11 +28,16 @@ const WINDOW_TITLE: &str = "Milo";
 const MILO_DISPLAY_SIZE: i32 = 128;
 
 fn main() -> gtk::glib::ExitCode {
+    let debug_intervention =
+        std::env::args_os().any(|argument| argument == OsStr::new("--debug-intervention"));
+    let application_arguments = std::env::args_os()
+        .filter(|argument| argument != OsStr::new("--debug-intervention"))
+        .collect::<Vec<_>>();
     let app = gtk::Application::builder()
         .application_id(APPLICATION_ID)
         .build();
 
-    app.connect_activate(build_ui);
+    app.connect_activate(move |app| build_ui(app, debug_intervention));
 
     let should_quit = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&should_quit);
@@ -43,10 +54,10 @@ fn main() -> gtk::glib::ExitCode {
         }
     });
 
-    app.run()
+    app.run_with_args_os(&application_arguments)
 }
 
-fn build_ui(app: &gtk::Application) {
+fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let css = gtk::CssProvider::new();
     css.load_from_data(
         r#"
@@ -63,6 +74,15 @@ fn build_ui(app: &gtk::Application) {
                 background-color: transparent;
                 margin: 0;
                 padding: 0;
+            }
+
+            popover.milo-intervention > contents {
+                border-radius: 12px;
+                padding: 4px;
+            }
+
+            .milo-intervention-prompt {
+                font-weight: bold;
             }
         "#,
     );
@@ -98,12 +118,28 @@ fn build_ui(app: &gtk::Application) {
 
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
     let behavior = BehaviorController::new(animator);
-    let distraction = DistractionController::new();
+    let intervention_view = InterventionView::new(&picture);
+    let presentation_view = intervention_view.clone();
+    let intervention = Rc::new(InterventionController::new(move |presentation| {
+        presentation_view.present(presentation);
+    }));
+    intervention_view.connect_responses(&intervention);
+
+    let distraction_behavior = behavior.clone();
+    let distraction_intervention = Rc::clone(&intervention);
+    let distraction = DistractionController::new(move |event| {
+        distraction_behavior.handle_distraction_event(event);
+        distraction_intervention.handle_distraction_event(event);
+    });
     distraction.start_threshold_monitor();
 
     let idle_distraction = distraction.clone();
+    let idle_intervention = Rc::clone(&intervention);
     behavior.start_idle_monitor(move |system_idle| {
         idle_distraction.update_system_idle(system_idle);
+        if system_idle {
+            idle_intervention.system_idle();
+        }
     });
     let activity_behavior = behavior.clone();
     let desktop_distraction = distraction.clone();
@@ -127,6 +163,89 @@ fn build_ui(app: &gtk::Application) {
     setup_debug_state_switch(&window, behavior);
 
     window.present();
+
+    if debug_intervention {
+        let debug_view = intervention_view.clone();
+        gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || {
+            debug_view.present(InterventionPresentation::Show(Intervention::StillScrolling));
+        });
+    }
+}
+
+#[derive(Clone)]
+struct InterventionView {
+    popover: gtk::Popover,
+    prompt: gtk::Label,
+    take_break: gtk::Button,
+    keep_scrolling: gtk::Button,
+}
+
+impl InterventionView {
+    fn new(anchor: &gtk::Picture) -> Self {
+        let prompt = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .css_classes(["milo-intervention-prompt"])
+            .build();
+        let take_break = gtk::Button::with_label(InterventionResponse::TakeBreak.label());
+        take_break.set_focus_on_click(false);
+        let keep_scrolling = gtk::Button::with_label(InterventionResponse::KeepScrolling.label());
+        keep_scrolling.set_focus_on_click(false);
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.append(&take_break);
+        actions.append(&keep_scrolling);
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        content.set_margin_top(10);
+        content.set_margin_bottom(10);
+        content.set_margin_start(10);
+        content.set_margin_end(10);
+        content.append(&prompt);
+        content.append(&actions);
+
+        let popover = gtk::Popover::builder()
+            .autohide(false)
+            .has_arrow(true)
+            .position(gtk::PositionType::Top)
+            .child(&content)
+            .build();
+        popover.add_css_class("milo-intervention");
+        popover.set_parent(anchor);
+
+        Self {
+            popover,
+            prompt,
+            take_break,
+            keep_scrolling,
+        }
+    }
+
+    fn connect_responses(&self, controller: &Rc<InterventionController>) {
+        let take_break_controller = Rc::downgrade(controller);
+        self.take_break.connect_clicked(move |_| {
+            if let Some(controller) = take_break_controller.upgrade() {
+                controller.respond(InterventionResponse::TakeBreak);
+            }
+        });
+
+        let keep_scrolling_controller = Rc::downgrade(controller);
+        self.keep_scrolling.connect_clicked(move |_| {
+            if let Some(controller) = keep_scrolling_controller.upgrade() {
+                controller.respond(InterventionResponse::KeepScrolling);
+            }
+        });
+    }
+
+    fn present(&self, presentation: InterventionPresentation) {
+        match presentation {
+            InterventionPresentation::Show(intervention) => {
+                self.prompt.set_label(intervention.prompt());
+                eprintln!("[milo] GTK: calling intervention popover.popup()");
+                self.popover.popup();
+            }
+            InterventionPresentation::Hide => self.popover.popdown(),
+        }
+    }
 }
 
 fn setup_debug_state_switch(window: &gtk::ApplicationWindow, behavior: BehaviorController) {
