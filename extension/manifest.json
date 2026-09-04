@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Milo Browser Activity",
+  "version": "0.1.0",
+  "description": "Classifies the active Firefox tab for Milo development.",
+  "permissions": ["tabs"],
+  "background": {
+    "scripts": ["background.js"]
+  }
+}
