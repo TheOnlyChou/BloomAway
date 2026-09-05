@@ -150,8 +150,9 @@ application that was already focused at startup.
 Milo also listens on the user-local Unix socket
 `$XDG_RUNTIME_DIR/milo/browser.sock`. The socket's parent directory is mode
 `0700` and the socket is mode `0600`. A dedicated listener thread accepts
-newline-delimited JSON from `milo-native-host`, validates it, and sends only the
-parsed `BrowserActivity` through a channel to a task on the GLib main context.
+newline-delimited JSON from `milo-native-host`, validates it, and sends parsed
+browser events through a channel to a task on the GLib main context. The same
+persistent socket carries narrow browser commands in the opposite direction.
 The main-context callback logs each received category, for example:
 
 ```text
@@ -171,6 +172,11 @@ socket connection to Milo; a local connection or write failure is logged and
 retried on the next browser message without ending the Firefox connection.
 Valid category-only messages cross the local socket as one JSON object per
 line. It opens no TCP ports and persists nothing.
+
+Commands from Milo are newline-delimited on the local socket, then a dedicated
+native-host writer thread serializes them to Firefox as four-byte
+native-endian-length-prefixed JSON. That thread is the sole owner of stdout, so
+frames cannot interleave and diagnostics remain on stderr.
 
 Firefox connection loss is represented explicitly on the local protocol as
 `{"type":"browser_tracking_unavailable"}`. Milo does not interpret the end of
@@ -233,8 +239,8 @@ recompute the authoritative state, so an obsolete callback cannot replace
 Concerned with Idle. System idle clears the session; resume therefore ends at
 Idle rather than restoring the old Concerned state.
 
-No threshold closes tabs, blocks sites, changes pages, sends Firefox commands,
-or produces scores, story progression, or persistence.
+No threshold automatically closes tabs, blocks sites, changes pages, or
+produces scores, story progression, or persistence.
 
 ### Still-scrolling intervention
 
@@ -248,9 +254,25 @@ GTK presents the request as a small `GtkPopover` parented to Milo's existing
 picture, above the character. It contains `Still scrolling?` plus `Take a break`
 and `Keep scrolling` buttons. Button callbacks emit the local semantic
 responses `TakeBreak` and `KeepScrolling`, dismiss the popover, and log the
-response. Neither response changes the distraction session or communicates
-with Firefox, so Milo remains Concerned until the user actually leaves the
-distracting context.
+response. `KeepScrolling` sends no browser command. `TakeBreak` asks the browser
+bridge to send the single semantic command `CloseActiveDistractionTab`; if no
+native host is currently connected, the command is discarded rather than
+queued. Neither response directly changes the distraction session.
+
+Milo logs `browser command requested` before the bridge call and `browser
+command sent` only after the local Unix write succeeds. The helper logs local
+receipt, Firefox forwarding, and successful framed stdout completion. Command
+results return through Firefox Native Messaging stdin and the Unix socket and
+are logged by Milo without affecting `MiloState`.
+
+Firefox remains the final authority. On receiving the command, the extension
+freshly queries the focused Firefox window and its current active tab, runs the
+current URL through the existing classifier, and calls `tabs.remove` only for
+`YouTubeShorts` or `InstagramReels`. Normal YouTube, Instagram, other pages,
+missing tabs, and malformed commands are ignored. This final check protects a
+normal tab selected after the intervention appeared from a stale close command.
+After a successful close, ordinary active-tab tracking reports the newly
+selected context and the distraction controller reacts to that real state.
 
 The requested-this-session flag remains set after dismissal, preventing the
 same continuous session from reopening the intervention. Session end, a direct
@@ -293,6 +315,20 @@ alter intervention eligibility.
     Concerned state and intervention must not return.
 11. Right-click repeatedly and confirm the debug cycle still includes
     Concerned without answering the intervention.
+
+### Manual browser-command tests
+
+1. Reach the intervention on Shorts and choose `Keep scrolling`. Confirm the
+   popup closes, the tab remains open, Milo stays Concerned, and no browser
+   command is logged.
+2. Start a fresh Shorts session, reach the intervention, and choose `Take a
+   break`. Confirm Milo logs `CloseActiveDistractionTab`, the active Shorts tab
+   closes, and subsequent `BrowserActivity` naturally ends or continues the
+   session according to the newly selected tab.
+3. Reach the intervention, switch Firefox to a normal page before the action
+   is processed, and trigger `TakeBreak` if possible. Confirm the normal tab is
+   not closed and Milo logs the `ignored_not_distracting` result.
+4. Repeat the successful close test with Instagram Reels.
 
 ## How dragging works
 

@@ -8,13 +8,14 @@ mod intervention;
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
 use behavior::BehaviorController;
-use browser_listener::{BrowserActivityEvent, start_browser_activity_monitor};
+use browser_listener::{BrowserActivityEvent, BrowserBridge, start_browser_activity_monitor};
 use distraction::DistractionController;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use intervention::{
     Intervention, InterventionController, InterventionPresentation, InterventionResponse,
 };
+use milo::browser::{BrowserCommand, BrowserCommandResult};
 use std::ffi::OsStr;
 use std::rc::Rc;
 use std::sync::{
@@ -118,11 +119,26 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
 
     let animator = MiloAnimator::new(&picture).unwrap_or_else(|error| panic!("{error}"));
     let behavior = BehaviorController::new(animator);
+    let browser_bridge = BrowserBridge::new();
     let intervention_view = InterventionView::new(&picture);
     let presentation_view = intervention_view.clone();
-    let intervention = Rc::new(InterventionController::new(move |presentation| {
-        presentation_view.present(presentation);
-    }));
+    let response_browser_bridge = browser_bridge.clone();
+    let intervention = Rc::new(InterventionController::new(
+        move |presentation| {
+            presentation_view.present(presentation);
+        },
+        move |response| {
+            let Some(command) = browser_command_for_intervention_response(response) else {
+                return;
+            };
+
+            eprintln!("[milo] browser command requested: {command:?}");
+            match response_browser_bridge.send(command) {
+                Ok(()) => eprintln!("[milo] browser command sent: {command:?}"),
+                Err(error) => eprintln!("[milo] browser command unavailable: {error}"),
+            }
+        },
+    ));
     intervention_view.connect_responses(&intervention);
 
     let distraction_behavior = behavior.clone();
@@ -152,10 +168,13 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
             desktop_distraction.update_desktop_activity(current);
         },
     );
-    start_browser_activity_monitor(move |event| match event {
+    start_browser_activity_monitor(browser_bridge, move |event| match event {
         BrowserActivityEvent::Activity(activity) => {
             eprintln!("[milo] browser activity: {activity:?}");
             distraction.update_browser_activity(activity);
+        }
+        BrowserActivityEvent::CommandResult { result, .. } => {
+            log_browser_command_result(result);
         }
         BrowserActivityEvent::Unavailable => distraction.browser_unavailable(),
     });
@@ -169,6 +188,36 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
         gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || {
             debug_view.present(InterventionPresentation::Show(Intervention::StillScrolling));
         });
+    }
+}
+
+fn log_browser_command_result(result: BrowserCommandResult) {
+    eprintln!("[milo] browser command result: {result}");
+}
+
+fn browser_command_for_intervention_response(
+    response: InterventionResponse,
+) -> Option<BrowserCommand> {
+    match response {
+        InterventionResponse::TakeBreak => Some(BrowserCommand::CloseActiveDistractionTab),
+        InterventionResponse::KeepScrolling => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_take_break_maps_to_a_browser_command() {
+        assert_eq!(
+            browser_command_for_intervention_response(InterventionResponse::TakeBreak),
+            Some(BrowserCommand::CloseActiveDistractionTab)
+        );
+        assert_eq!(
+            browser_command_for_intervention_response(InterventionResponse::KeepScrolling),
+            None
+        );
     }
 }
 

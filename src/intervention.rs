@@ -118,21 +118,25 @@ impl InterventionLifecycle {
 }
 
 type PresentationHandler = Rc<RefCell<Box<dyn FnMut(InterventionPresentation)>>>;
+type ResponseHandler = Rc<RefCell<Box<dyn FnMut(InterventionResponse)>>>;
 
 #[derive(Clone)]
 pub struct InterventionController {
     lifecycle: Rc<RefCell<InterventionLifecycle>>,
     presentation_handler: PresentationHandler,
+    response_handler: ResponseHandler,
 }
 
 impl InterventionController {
-    pub fn new<F>(presentation_handler: F) -> Self
+    pub fn new<F, G>(presentation_handler: F, response_handler: G) -> Self
     where
         F: FnMut(InterventionPresentation) + 'static,
+        G: FnMut(InterventionResponse) + 'static,
     {
         Self {
             lifecycle: Rc::new(RefCell::new(InterventionLifecycle::new())),
             presentation_handler: Rc::new(RefCell::new(Box::new(presentation_handler))),
+            response_handler: Rc::new(RefCell::new(Box::new(response_handler))),
         }
     }
 
@@ -168,6 +172,7 @@ impl InterventionController {
                 }
                 InterventionAction::Response(response) => {
                     eprintln!("[milo] intervention response: {response:?}");
+                    (self.response_handler.borrow_mut())(response);
                 }
             }
         }
@@ -231,9 +236,12 @@ mod tests {
     fn controller_delivers_show_to_the_presentation_callback() {
         let presentations = Rc::new(RefCell::new(Vec::new()));
         let captured_presentations = Rc::clone(&presentations);
-        let controller = InterventionController::new(move |presentation| {
-            captured_presentations.borrow_mut().push(presentation);
-        });
+        let controller = InterventionController::new(
+            move |presentation| {
+                captured_presentations.borrow_mut().push(presentation);
+            },
+            |_| {},
+        );
 
         controller.handle_distraction_event(started(DistractionKind::YouTubeShorts));
         controller.handle_distraction_event(threshold(THIRD_THRESHOLD_SECONDS));

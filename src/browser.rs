@@ -1,3 +1,4 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{self, BufRead, Read, Write};
@@ -28,6 +29,56 @@ pub struct BrowserActivityMessage {
     pub activity: BrowserActivity,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BrowserCommand {
+    #[serde(rename = "close_active_distraction_tab")]
+    CloseActiveDistractionTab,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserCommandMessage {
+    #[serde(rename = "type")]
+    message_type: BrowserCommandMessageType,
+    pub command: BrowserCommand,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum BrowserCommandResult {
+    #[serde(rename = "closed")]
+    Closed,
+    #[serde(rename = "ignored_not_distracting")]
+    IgnoredNotDistracting,
+    #[serde(rename = "no_active_tab")]
+    NoActiveTab,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl std::fmt::Display for BrowserCommandResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Closed => "closed",
+            Self::IgnoredNotDistracting => "ignored_not_distracting",
+            Self::NoActiveTab => "no_active_tab",
+            Self::Error => "error",
+        };
+        formatter.write_str(value)
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+pub enum FirefoxMessage {
+    #[serde(rename = "browser_activity")]
+    Activity { activity: BrowserActivity },
+    #[serde(rename = "browser_command_result")]
+    CommandResult {
+        command: BrowserCommand,
+        result: BrowserCommandResult,
+    },
+}
+
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum LocalBrowserMessage {
@@ -35,6 +86,11 @@ pub enum LocalBrowserMessage {
     Activity { activity: BrowserActivity },
     #[serde(rename = "browser_tracking_unavailable")]
     TrackingUnavailable,
+    #[serde(rename = "browser_command_result")]
+    CommandResult {
+        command: BrowserCommand,
+        result: BrowserCommandResult,
+    },
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,11 +99,26 @@ enum BrowserMessageType {
     BrowserActivity,
 }
 
+#[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
+enum BrowserCommandMessageType {
+    #[serde(rename = "browser_command")]
+    BrowserCommand,
+}
+
 impl BrowserActivityMessage {
     pub fn new(activity: BrowserActivity) -> Self {
         Self {
             message_type: BrowserMessageType::BrowserActivity,
             activity,
+        }
+    }
+}
+
+impl BrowserCommandMessage {
+    pub fn new(command: BrowserCommand) -> Self {
+        Self {
+            message_type: BrowserCommandMessageType::BrowserCommand,
+            command,
         }
     }
 }
@@ -61,6 +132,14 @@ pub fn browser_socket_path() -> io::Result<PathBuf> {
 }
 
 pub fn decode_browser_message(payload: &[u8]) -> serde_json::Result<BrowserActivityMessage> {
+    serde_json::from_slice(payload)
+}
+
+pub fn decode_firefox_message(payload: &[u8]) -> serde_json::Result<FirefoxMessage> {
+    serde_json::from_slice(payload)
+}
+
+pub fn decode_browser_command(payload: &[u8]) -> serde_json::Result<BrowserCommandMessage> {
     serde_json::from_slice(payload)
 }
 
@@ -99,7 +178,13 @@ pub fn write_native_message<W: Write>(writer: &mut W, payload: &[u8]) -> io::Res
     }
 
     writer.write_all(&length.to_ne_bytes())?;
-    writer.write_all(payload)
+    writer.write_all(payload)?;
+    writer.flush()
+}
+
+pub fn write_native_json<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Result<()> {
+    let payload = serde_json::to_vec(message).map_err(io::Error::other)?;
+    write_native_message(writer, &payload)
 }
 
 pub fn write_local_message<W: Write>(
@@ -113,6 +198,21 @@ pub fn write_local_tracking_unavailable<W: Write>(writer: &mut W) -> io::Result<
     write_local_json(writer, &LocalBrowserMessage::TrackingUnavailable)
 }
 
+pub fn write_local_command<W: Write>(writer: &mut W, command: BrowserCommand) -> io::Result<()> {
+    write_local_json(writer, &BrowserCommandMessage::new(command))
+}
+
+pub fn write_local_command_result<W: Write>(
+    writer: &mut W,
+    command: BrowserCommand,
+    result: BrowserCommandResult,
+) -> io::Result<()> {
+    write_local_json(
+        writer,
+        &LocalBrowserMessage::CommandResult { command, result },
+    )
+}
+
 fn write_local_json<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::Result<()> {
     serde_json::to_writer(&mut *writer, message).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
@@ -120,6 +220,14 @@ fn write_local_json<W: Write, T: Serialize>(writer: &mut W, message: &T) -> io::
 }
 
 pub fn read_local_message<R: BufRead>(reader: &mut R) -> io::Result<Option<LocalBrowserMessage>> {
+    read_local_json(reader)
+}
+
+pub fn read_local_command<R: BufRead>(reader: &mut R) -> io::Result<Option<BrowserCommandMessage>> {
+    read_local_json(reader)
+}
+
+fn read_local_json<R: BufRead, T: DeserializeOwned>(reader: &mut R) -> io::Result<Option<T>> {
     let mut payload = Vec::new();
     let byte_count = reader
         .take((MAX_LOCAL_MESSAGE_SIZE + 1) as u64)
@@ -189,6 +297,32 @@ mod tests {
     }
 
     #[test]
+    fn serializes_close_active_distraction_tab_command() {
+        let message = BrowserCommandMessage::new(BrowserCommand::CloseActiveDistractionTab);
+
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"type":"browser_command","command":"close_active_distraction_tab"}"#
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_browser_commands() {
+        assert!(
+            decode_browser_command(
+                br#"{"type":"browser_command","command":"close_arbitrary_tab"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            decode_browser_command(
+                br#"{"type":"browser_command","command":"close_active_distraction_tab","url":"https://example.com"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reads_native_length_framing() {
         let payload = br#"{"type":"browser_activity","activity":"youtube_shorts"}"#;
         let mut framed = Vec::new();
@@ -220,6 +354,25 @@ mod tests {
             );
         }
         assert_eq!(read_native_message(&mut input).unwrap(), None);
+    }
+
+    #[test]
+    fn frames_multiple_outgoing_native_commands() {
+        let messages = [
+            BrowserCommandMessage::new(BrowserCommand::CloseActiveDistractionTab),
+            BrowserCommandMessage::new(BrowserCommand::CloseActiveDistractionTab),
+        ];
+        let mut output = Vec::new();
+        for message in &messages {
+            write_native_json(&mut output, message).unwrap();
+        }
+
+        let mut framed = Cursor::new(output);
+        for expected in messages {
+            let payload = read_native_message(&mut framed).unwrap().unwrap();
+            assert_eq!(decode_browser_command(&payload).unwrap(), expected);
+        }
+        assert_eq!(read_native_message(&mut framed).unwrap(), None);
     }
 
     #[test]
@@ -265,5 +418,35 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded, LocalBrowserMessage::TrackingUnavailable);
+    }
+
+    #[test]
+    fn local_protocol_reads_commands_in_the_reverse_direction() {
+        let mut encoded = Vec::new();
+        write_local_command(&mut encoded, BrowserCommand::CloseActiveDistractionTab).unwrap();
+
+        let decoded = read_local_command(&mut BufReader::new(Cursor::new(encoded)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded,
+            BrowserCommandMessage::new(BrowserCommand::CloseActiveDistractionTab)
+        );
+    }
+
+    #[test]
+    fn local_protocol_carries_browser_command_results() {
+        let command = BrowserCommand::CloseActiveDistractionTab;
+        let result = BrowserCommandResult::IgnoredNotDistracting;
+        let mut encoded = Vec::new();
+        write_local_command_result(&mut encoded, command, result).unwrap();
+
+        let decoded = read_local_message(&mut BufReader::new(Cursor::new(encoded)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded,
+            LocalBrowserMessage::CommandResult { command, result }
+        );
     }
 }

@@ -2,22 +2,87 @@ use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gtk4::glib;
 use milo::browser::{
-    BrowserActivity, LocalBrowserMessage, browser_socket_path, read_local_message,
+    BrowserActivity, BrowserCommand, BrowserCommandResult, LocalBrowserMessage,
+    browser_socket_path, read_local_message, write_local_command,
 };
 use std::fs;
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrowserActivityEvent {
     Activity(BrowserActivity),
+    CommandResult {
+        command: BrowserCommand,
+        result: BrowserCommandResult,
+    },
     Unavailable,
 }
 
-pub fn start_browser_activity_monitor<F>(mut on_browser_activity: F)
+#[derive(Debug)]
+pub enum BrowserCommandSendError {
+    Unavailable,
+    Transport(io::Error),
+}
+
+impl std::fmt::Display for BrowserCommandSendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("native host is unavailable"),
+            Self::Transport(error) => write!(formatter, "local transport failed: {error}"),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct BrowserBridge {
+    writer: Arc<Mutex<Option<UnixStream>>>,
+}
+
+impl BrowserBridge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn send(&self, command: BrowserCommand) -> Result<(), BrowserCommandSendError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| BrowserCommandSendError::Unavailable)?;
+        let result = match writer.as_mut() {
+            Some(stream) => write_local_command(stream, command),
+            None => return Err(BrowserCommandSendError::Unavailable),
+        };
+        if let Err(error) = result {
+            *writer = None;
+            return Err(BrowserCommandSendError::Transport(error));
+        }
+        Ok(())
+    }
+
+    fn attach(&self, stream: &UnixStream) -> io::Result<()> {
+        let command_writer = stream.try_clone()?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| io::Error::other("browser bridge lock is poisoned"))?;
+        *writer = Some(command_writer);
+        Ok(())
+    }
+
+    fn detach(&self) {
+        match self.writer.lock() {
+            Ok(mut writer) => *writer = None,
+            Err(_) => eprintln!("[milo] browser bridge lock is poisoned"),
+        }
+    }
+}
+
+pub fn start_browser_activity_monitor<F>(bridge: BrowserBridge, mut on_browser_activity: F)
 where
     F: FnMut(BrowserActivityEvent) + 'static,
 {
@@ -32,7 +97,7 @@ where
     if let Err(error) = thread::Builder::new()
         .name("milo-browser-activity".into())
         .spawn(move || {
-            if let Err(error) = run_browser_listener(sender) {
+            if let Err(error) = run_browser_listener(sender, bridge) {
                 eprintln!("[milo] browser activity unavailable: {error}");
             }
         })
@@ -41,16 +106,23 @@ where
     }
 }
 
-fn run_browser_listener(sender: UnboundedSender<BrowserActivityEvent>) -> io::Result<()> {
+fn run_browser_listener(
+    sender: UnboundedSender<BrowserActivityEvent>,
+    bridge: BrowserBridge,
+) -> io::Result<()> {
     let socket_path = browser_socket_path()?;
     let listener = bind_local_socket(&socket_path)?;
 
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
+                if let Err(error) = bridge.attach(&stream) {
+                    eprintln!("[milo] browser command unavailable: {error}");
+                }
                 if let Err(error) = forward_browser_messages(stream, &sender) {
                     eprintln!("[milo] browser connection closed: {error}");
                 }
+                bridge.detach();
             }
             Err(error) => eprintln!("[milo] could not accept browser connection: {error}"),
         }
@@ -140,6 +212,9 @@ fn forward_browser_messages<R: Read>(
         let event = match message {
             LocalBrowserMessage::Activity { activity } => BrowserActivityEvent::Activity(activity),
             LocalBrowserMessage::TrackingUnavailable => BrowserActivityEvent::Unavailable,
+            LocalBrowserMessage::CommandResult { command, result } => {
+                BrowserActivityEvent::CommandResult { command, result }
+            }
         };
         if sender.unbounded_send(event).is_err() {
             return Ok(());
@@ -191,6 +266,17 @@ mod tests {
             BrowserActivityEvent::Unavailable
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn sending_without_a_native_host_is_unavailable_and_not_queued() {
+        let bridge = BrowserBridge::new();
+
+        assert!(matches!(
+            bridge.send(BrowserCommand::CloseActiveDistractionTab),
+            Err(BrowserCommandSendError::Unavailable)
+        ));
+        assert!(bridge.writer.lock().unwrap().is_none());
     }
 
     #[test]

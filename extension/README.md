@@ -22,12 +22,14 @@ the Milo extension.
 From the repository root:
 
 ```bash
-cargo build --bin milo-native-host
 ./extension/native-host/install.sh
 ```
 
-The script resolves the binary to an absolute path and generates the manifest
-at Arch Linux native Firefox's user-level location:
+With no binary argument, the script first runs
+`cargo build --bin milo-native-host`. This ensures the manifest does not keep
+launching a stale helper after its source changes. The script then resolves the
+binary to an absolute path and generates the manifest at Arch Linux native
+Firefox's user-level location:
 
 ```text
 ~/.mozilla/native-messaging-hosts/com.milo.desktop.json
@@ -35,8 +37,8 @@ at Arch Linux native Firefox's user-level location:
 
 No root access is used. The committed JSON is a template with a
 `__MILO_NATIVE_HOST_PATH__` placeholder. To select another built binary, pass
-its path to the script. To remove the development registration, remove only
-the generated manifest:
+its path to the script; explicitly supplied binaries are not rebuilt. To remove
+the development registration, remove only the generated manifest:
 
 ```bash
 rm ~/.mozilla/native-messaging-hosts/com.milo.desktop.json
@@ -90,7 +92,7 @@ the extension port. Firefox stdin EOF (or an unusable Native Messaging frame)
 ends the helper and sends an explicit tracking-unavailable message to Milo when
 the local connection is available.
 
-Only messages with this shape cross Native Messaging:
+Activity messages from Firefox have this shape:
 
 ```json
 {"type":"browser_activity","activity":"youtube_shorts"}
@@ -98,6 +100,32 @@ Only messages with this shape cross Native Messaging:
 
 The other values are `youtube`, `instagram`, `instagram_reels`, and `other`.
 Full URLs and page titles are never sent to the native host.
+
+The reverse direction accepts exactly one command:
+
+```json
+{"type":"browser_command","command":"close_active_distraction_tab"}
+```
+
+For every valid command, the extension freshly obtains Firefox's focused
+window and queries its active tab. It classifies that tab's current URL with
+`classifyUrl()` immediately before removal. Only a current `YouTubeShorts` or
+`InstagramReels` tab is removed; it never searches background tabs or other
+windows. Normal YouTube, Instagram, other or inaccessible pages are left
+untouched. This fresh query is also the stale-command guard if the user changes
+tabs after the popup appeared.
+
+The extension returns `closed`, `ignored_not_distracting`, `no_active_tab`, or
+`error` as a semantic result. It sends no URL, title, tab ID, or page content:
+
+```json
+{"type":"browser_command_result","command":"close_active_distraction_tab","result":"closed"}
+```
+
+Command diagnostics identify each boundary without logging the URL. A
+successful action logs command receipt, active-tab query and classification,
+the removal attempt, `tab closed`, and the semantic result. Invalid native
+messages are reported without dumping their contents.
 
 ## URL classification
 
@@ -156,6 +184,42 @@ URLs become `Other`.
 11. Reload the extension or close Firefox. That genuine Native Messaging
     closure may produce `[milo-extension] native host disconnected`.
 
+## Manual browser-command tests
+
+- **Keep scrolling:** Reach the popup on Shorts and choose `Keep scrolling`.
+  The popup closes, the tab remains open, Milo remains Concerned, and no
+  browser command is sent.
+- **Take a break:** In a fresh Shorts session, reach the popup and choose `Take
+  a break`. The active Shorts tab closes. The extension then observes the new
+  active tab normally; Milo does not force its state from the command result.
+- **Stale command:** Reach the popup, switch to a normal site before the command
+  is handled, then trigger `TakeBreak` if possible. The extension reclassifies
+  the current tab as non-distracting and does not close it.
+- **Instagram Reels:** Repeat the successful `Take a break` flow on an active
+  Reels tab.
+
+For the close case, the chronological boundary logs should include:
+
+```text
+[milo] browser command requested: CloseActiveDistractionTab
+[milo] browser command sent: CloseActiveDistractionTab
+[milo-native-host] local command received: CloseActiveDistractionTab
+[milo-native-host] forwarding command to Firefox
+[milo-native-host] command frame written to Firefox
+[milo-extension] browser command received: close_active_distraction_tab
+[milo-extension] close command: querying active tab
+[milo-extension] close command classification: YouTubeShorts
+[milo-extension] closing active distraction tab
+[milo-extension] tab closed
+[milo-extension] close command result: closed
+[milo] browser command result: closed
+```
+
+After rebuilding the helper, reload the temporary extension so Firefox closes
+the old native-host process and launches the current executable. `cargo run`
+alone builds the default Milo binary and does not refresh
+`target/debug/milo-native-host`.
+
 ## Classification test cases
 
 With the background console open, activate tabs containing these URLs:
@@ -191,5 +255,7 @@ To verify filtering and deduplication:
 
 No browsing history is collected. URLs are not persisted or transmitted (they
 appear only in the existing local debug log), and browser activity remains
-ephemeral. The extension performs no scoring, timers, blocking, tab closing,
-intervention, content inspection, scroll monitoring, dialogue, or state logic.
+ephemeral. The extension performs no scoring, timers, blocking, automatic tab
+closing, content inspection, scroll monitoring, dialogue, or state logic. Its
+only browser action is the explicitly requested, immediately revalidated close
+of the current active distracting tab.

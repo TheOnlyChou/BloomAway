@@ -8,6 +8,11 @@ manifest_template="${script_directory}/com.milo.desktop.json"
 install_directory="${HOME:?HOME must be set}/.mozilla/native-messaging-hosts"
 installed_manifest="${install_directory}/com.milo.desktop.json"
 
+if [[ $# -eq 0 ]]; then
+  echo "Building current milo-native-host..."
+  cargo build --manifest-path "${repository_root}/Cargo.toml" --bin milo-native-host
+fi
+
 if [[ ! -x "${host_binary}" ]]; then
   echo "Native host binary is missing or not executable: ${host_binary}" >&2
   echo "Build it first with: cargo build --bin milo-native-host" >&2
