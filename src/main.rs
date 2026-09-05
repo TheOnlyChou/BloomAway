@@ -4,18 +4,22 @@ mod behavior;
 mod browser_listener;
 mod distraction;
 mod intervention;
+mod narrative;
 
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
 use behavior::BehaviorController;
 use browser_listener::{BrowserActivityEvent, BrowserBridge, start_browser_activity_monitor};
-use distraction::DistractionController;
+use distraction::{DistractionController, DistractionEvent, SECOND_THRESHOLD_SECONDS};
 use gtk::prelude::*;
 use gtk4 as gtk;
 use intervention::{
     Intervention, InterventionController, InterventionPresentation, InterventionResponse,
 };
 use milo::browser::{BrowserCommand, BrowserCommandResult};
+use narrative::{DialogueLine, DialogueSequence, NarrativeController};
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::rc::Rc;
 use std::sync::{
@@ -85,6 +89,11 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
             .milo-intervention-prompt {
                 font-weight: bold;
             }
+
+            popover.milo-narrative > contents {
+                border-radius: 12px;
+                padding: 10px;
+            }
         "#,
     );
 
@@ -121,17 +130,25 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let behavior = BehaviorController::new(animator);
     let browser_bridge = BrowserBridge::new();
     let intervention_view = InterventionView::new(&picture);
-    let presentation_view = intervention_view.clone();
+    let narrative_view = NarrativeView::new(&picture);
+    let presentation = PresentationCoordinator::new(intervention_view.clone(), narrative_view);
+    let narrative_presentation = presentation.clone();
+    let narrative = NarrativeController::load(move |dialogue| {
+        narrative_presentation.enqueue_dialogue(dialogue);
+    });
+    let intervention_presentation = presentation.clone();
     let response_browser_bridge = browser_bridge.clone();
+    let response_narrative = narrative.clone();
     let intervention = Rc::new(InterventionController::new(
         move |presentation| {
-            presentation_view.present(presentation);
+            intervention_presentation.present_intervention(presentation);
         },
         move |response| {
             let Some(command) = browser_command_for_intervention_response(response) else {
                 return;
             };
 
+            response_narrative.break_accepted();
             eprintln!("[milo] browser command requested: {command:?}");
             match response_browser_bridge.send(command) {
                 Ok(()) => eprintln!("[milo] browser command sent: {command:?}"),
@@ -143,18 +160,32 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
 
     let distraction_behavior = behavior.clone();
     let distraction_intervention = Rc::clone(&intervention);
+    let distraction_narrative = narrative.clone();
     let distraction = DistractionController::new(move |event| {
         distraction_behavior.handle_distraction_event(event);
         distraction_intervention.handle_distraction_event(event);
+        if matches!(
+            event,
+            DistractionEvent::Threshold {
+                seconds: SECOND_THRESHOLD_SECONDS,
+                ..
+            }
+        ) {
+            distraction_narrative.became_concerned();
+        }
     });
     distraction.start_threshold_monitor();
 
     let idle_distraction = distraction.clone();
     let idle_intervention = Rc::clone(&intervention);
+    let idle_narrative = narrative.clone();
     behavior.start_idle_monitor(move |system_idle| {
         idle_distraction.update_system_idle(system_idle);
         if system_idle {
             idle_intervention.system_idle();
+            idle_narrative.system_idle();
+        } else {
+            idle_narrative.system_resumed();
         }
     });
     let activity_behavior = behavior.clone();
@@ -182,12 +213,216 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     setup_debug_state_switch(&window, behavior);
 
     window.present();
+    eprintln!("[milo] GTK: window presented");
+    setup_narrative_startup(&picture, narrative);
 
     if debug_intervention {
-        let debug_view = intervention_view.clone();
+        let debug_presentation = presentation.clone();
         gtk::glib::timeout_add_local_once(Duration::from_secs(1), move || {
-            debug_view.present(InterventionPresentation::Show(Intervention::StillScrolling));
+            debug_presentation
+                .present_intervention(InterventionPresentation::Show(Intervention::StillScrolling));
         });
+    }
+}
+
+#[derive(Default)]
+struct NarrativeStartupGuard {
+    scheduled_or_triggered: Cell<bool>,
+}
+
+impl NarrativeStartupGuard {
+    fn try_schedule(&self) -> bool {
+        !self.scheduled_or_triggered.replace(true)
+    }
+
+    fn cancel_pending(&self) {
+        self.scheduled_or_triggered.set(false);
+    }
+}
+
+fn setup_narrative_startup(picture: &gtk::Picture, narrative: NarrativeController) {
+    let guard = Rc::new(NarrativeStartupGuard::default());
+
+    let mapped_narrative = narrative.clone();
+    let mapped_guard = Rc::clone(&guard);
+    picture.connect_map(move |picture| {
+        schedule_narrative_startup(picture, mapped_narrative.clone(), Rc::clone(&mapped_guard));
+    });
+
+    // `present()` may map the widget synchronously, before the signal handler above exists.
+    if picture.is_mapped() {
+        schedule_narrative_startup(picture, narrative, guard);
+    }
+}
+
+fn schedule_narrative_startup(
+    picture: &gtk::Picture,
+    narrative: NarrativeController,
+    guard: Rc<NarrativeStartupGuard>,
+) {
+    if !guard.try_schedule() {
+        return;
+    }
+
+    eprintln!("[milo] GTK: Milo mapped");
+    let weak_picture = picture.downgrade();
+    gtk::glib::idle_add_local_once(move || {
+        let Some(picture) = weak_picture.upgrade() else {
+            guard.cancel_pending();
+            return;
+        };
+        if !picture.is_mapped() {
+            guard.cancel_pending();
+            return;
+        }
+
+        eprintln!("[milo] narrative startup ready");
+        narrative.first_launch();
+    });
+}
+
+#[derive(Clone)]
+struct PresentationCoordinator {
+    intervention: InterventionView,
+    narrative: NarrativeView,
+}
+
+impl PresentationCoordinator {
+    fn new(intervention: InterventionView, narrative: NarrativeView) -> Self {
+        Self {
+            intervention,
+            narrative,
+        }
+    }
+
+    fn present_intervention(&self, presentation: InterventionPresentation) {
+        match presentation {
+            InterventionPresentation::Show(_) => {
+                self.narrative.set_intervention_visible(true);
+                self.intervention.present(presentation);
+            }
+            InterventionPresentation::Hide => {
+                self.intervention.present(presentation);
+                self.narrative.set_intervention_visible(false);
+            }
+        }
+    }
+
+    fn enqueue_dialogue(&self, dialogue: DialogueSequence) {
+        self.narrative.enqueue(dialogue);
+    }
+}
+
+#[derive(Default)]
+struct NarrativeViewState {
+    queued_lines: VecDeque<DialogueLine>,
+    current_line: Option<DialogueLine>,
+    timeout: Option<gtk::glib::SourceId>,
+    intervention_visible: bool,
+}
+
+struct NarrativeViewInner {
+    popover: gtk::Popover,
+    label: gtk::Label,
+    state: RefCell<NarrativeViewState>,
+}
+
+#[derive(Clone)]
+struct NarrativeView {
+    inner: Rc<NarrativeViewInner>,
+}
+
+impl NarrativeView {
+    fn new(anchor: &gtk::Picture) -> Self {
+        let label = gtk::Label::builder()
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .max_width_chars(32)
+            .build();
+        let popover = gtk::Popover::builder()
+            .autohide(false)
+            .has_arrow(true)
+            .position(gtk::PositionType::Top)
+            .child(&label)
+            .build();
+        popover.add_css_class("milo-narrative");
+        popover.set_can_target(false);
+        popover.set_parent(anchor);
+
+        Self {
+            inner: Rc::new(NarrativeViewInner {
+                popover,
+                label,
+                state: RefCell::new(NarrativeViewState::default()),
+            }),
+        }
+    }
+
+    fn enqueue(&self, dialogue: DialogueSequence) {
+        self.inner
+            .state
+            .borrow_mut()
+            .queued_lines
+            .extend(dialogue.into_lines());
+        self.show_next_line();
+    }
+
+    fn set_intervention_visible(&self, visible: bool) {
+        let timeout = {
+            let mut state = self.inner.state.borrow_mut();
+            state.intervention_visible = visible;
+            if visible { state.timeout.take() } else { None }
+        };
+        if let Some(timeout) = timeout {
+            timeout.remove();
+        }
+        if visible {
+            self.inner.popover.popdown();
+        } else {
+            self.show_next_line();
+        }
+    }
+
+    fn show_next_line(&self) {
+        let (line, is_new) = {
+            let mut state = self.inner.state.borrow_mut();
+            if state.intervention_visible || state.timeout.is_some() {
+                return;
+            }
+
+            match state.current_line {
+                Some(line) => (line, false),
+                None => {
+                    let Some(line) = state.queued_lines.pop_front() else {
+                        self.inner.popover.popdown();
+                        return;
+                    };
+                    state.current_line = Some(line);
+                    (line, true)
+                }
+            }
+        };
+
+        self.inner.label.set_label(line.text);
+        if is_new {
+            eprintln!("[milo] narrative dialogue: {:?}", line.text);
+        }
+        self.inner.popover.popup();
+
+        let weak_inner = Rc::downgrade(&self.inner);
+        let timeout = gtk::glib::timeout_add_local_once(line.duration, move || {
+            let Some(inner) = weak_inner.upgrade() else {
+                return;
+            };
+            {
+                let mut state = inner.state.borrow_mut();
+                state.timeout.take();
+                state.current_line = None;
+            }
+            inner.popover.popdown();
+            Self { inner }.show_next_line();
+        });
+        self.inner.state.borrow_mut().timeout = Some(timeout);
     }
 }
 
@@ -218,6 +453,18 @@ mod tests {
             browser_command_for_intervention_response(InterventionResponse::KeepScrolling),
             None
         );
+    }
+
+    #[test]
+    fn narrative_startup_guard_allows_only_one_scheduled_trigger() {
+        let guard = NarrativeStartupGuard::default();
+
+        assert!(guard.try_schedule());
+        assert!(!guard.try_schedule());
+
+        guard.cancel_pending();
+        assert!(guard.try_schedule());
+        assert!(!guard.try_schedule());
     }
 }
 

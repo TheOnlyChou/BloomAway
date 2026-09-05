@@ -240,7 +240,8 @@ Concerned with Idle. System idle clears the session; resume therefore ends at
 Idle rather than restoring the old Concerned state.
 
 No threshold automatically closes tabs, blocks sites, changes pages, or
-produces scores, story progression, or persistence.
+produces scores. The 20-second semantic threshold may produce the one-time
+narrative line described below, without changing distraction behavior.
 
 ### Still-scrolling intervention
 
@@ -330,6 +331,79 @@ alter intervention eligibility.
    not closed and Milo logs the `ignored_not_distracting` result.
 4. Repeat the successful close test with Instagram Reels.
 
+## Minimal narrative progression
+
+`NarrativeEngine` observes only semantic events: first launch, the first real
+20-second distraction threshold, an accepted break, and a return proven by
+system idle followed by resume. It does not access GTK, animation state,
+Firefox, or either browser transport. In particular, right-clicking to cycle
+Milo to Concerned does not emit a narrative trigger.
+
+Narrative progress contains only `introduction_seen`,
+`concerned_dialogue_seen`, `breaks_accepted`, `return_dialogue_seen`, and
+`eli_revealed`. It is stored as JSON at:
+
+```text
+$XDG_STATE_HOME/bloomaway/narrative.json
+```
+
+When `XDG_STATE_HOME` is unset, Milo uses
+`~/.local/state/bloomaway/narrative.json`. Saves use a same-directory temporary
+file followed by rename. Missing, unreadable, or malformed state falls back to
+fresh progress with a diagnostic; load and save failures never stop Milo. No
+URL, title, application history, or browser history is persisted.
+
+An accepted break sets an in-memory pending flag. A subsequent genuine system
+idle marks that break as observed, and only the following resume can emit
+`ReturnedAfterBreak`. Closing or changing a browser tab alone is not accepted
+as proof of taking a break.
+
+Narrative dialogue uses a separate buttonless `GtkPopover` attached above
+Milo. Lines display sequentially for four seconds each and dismiss after the
+last line. A tiny in-memory line queue keeps ordering deterministic. The
+intervention popover has priority: showing it pauses and hides narrative
+dialogue, while hiding it resumes the interrupted line. Consequently a
+`BreakAccepted` sequence queued by a button response appears only after the
+intervention has closed.
+
+At startup, Milo presents its window before arming the introduction. The
+picture's GTK `map` signal (or its already-mapped state when `present()` maps
+synchronously) schedules a one-shot GLib idle callback on the main context.
+Only that callback emits `FirstLaunch`, so the narrative popover is attached,
+mapped, and ready before the introduction is persisted and displayed.
+
+The initial narrative content is deliberately limited to:
+
+- First launch: `Hi.` then `You work here?`
+- First persistent Concerned event: `You've been staring at that for a while.`
+- First break: `Good.` then `...I mean, I'll be fine.`
+- First return after a proven break: `You came back.` then `I wasn't waiting.`
+- Second break: `Going somewhere?` then `...Good.`
+- Third break: `Found something earlier.`, `It has a name on it.`, then
+  `...Eli.`
+
+The third break sets `eli_revealed`; later breaks increment the persisted count
+without adding new dialogue yet.
+
+### Manual narrative test
+
+1. Move any existing `narrative.json` aside, then start Milo. Confirm Milo is
+   visible and the logs show `window presented`, `Milo mapped`, and `narrative
+   startup ready` before `FirstLaunch`. Confirm `Hi.` and `You work here?`
+   appear in order and do not repeat after restarting Milo.
+2. Reach Concerned through a real 20-second Shorts/Reels session. Confirm its
+   one-time line appears. Confirm the right-click debug cycle does not trigger
+   it.
+3. Reach the intervention and choose `Take a break`. Confirm the existing tab
+   close still occurs, then confirm the first-break sequence appears after the
+   intervention closes.
+4. After accepting a break, become system-idle and resume. Confirm the return
+   sequence appears once. Confirm ordinary idle/resume without a preceding
+   accepted break produces no return dialogue.
+5. Accept second and third breaks in fresh distraction sessions and confirm
+   their sequences, including the name `Eli`. Restart Milo and verify the
+   progress does not repeat earlier milestones.
+
 ## How dragging works
 
 `GtkApplicationWindow` creates a normal `GdkSurface` that implements the
@@ -341,5 +415,6 @@ movement until release. Milo contains no pointer-motion loop, coordinate
 calculation, layer-shell margins, or `hyprctl` movement commands.
 
 The transparent surface still receives pointer input; transparent-pixel
-click-through is not implemented. Milo has no persistence, browser URL
-tracking, productivity scoring, blocking, or automated movement behavior.
+click-through is not implemented. Milo persists only the small narrative
+progress record described above. It has no persisted browser URLs, productivity
+scoring, blocking, or automated movement behavior.
