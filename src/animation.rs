@@ -44,6 +44,39 @@ const PLAY_WITH_YARN_FRAME_PATHS: [&str; 8] = [
     "assets/milo/play_yarn/play_yarn_08.png",
 ];
 
+const STRETCH_FRAME_PATHS: [&str; 8] = [
+    "assets/milo/stretch/stretch_01.png",
+    "assets/milo/stretch/stretch_02.png",
+    "assets/milo/stretch/stretch_03.png",
+    "assets/milo/stretch/stretch_04.png",
+    "assets/milo/stretch/stretch_05.png",
+    "assets/milo/stretch/stretch_06.png",
+    "assets/milo/stretch/stretch_07.png",
+    "assets/milo/stretch/stretch_08.png",
+];
+
+const GROOMING_FRAME_PATHS: [&str; 8] = [
+    "assets/milo/grooming/grooming_01.png",
+    "assets/milo/grooming/grooming_02.png",
+    "assets/milo/grooming/grooming_03.png",
+    "assets/milo/grooming/grooming_04.png",
+    "assets/milo/grooming/grooming_05.png",
+    "assets/milo/grooming/grooming_06.png",
+    "assets/milo/grooming/grooming_07.png",
+    "assets/milo/grooming/grooming_08.png",
+];
+
+const LOOKING_AROUND_FRAME_PATHS: [&str; 8] = [
+    "assets/milo/looking_around/looking_around_01.png",
+    "assets/milo/looking_around/looking_around_02.png",
+    "assets/milo/looking_around/looking_around_03.png",
+    "assets/milo/looking_around/looking_around_04.png",
+    "assets/milo/looking_around/looking_around_05.png",
+    "assets/milo/looking_around/looking_around_06.png",
+    "assets/milo/looking_around/looking_around_07.png",
+    "assets/milo/looking_around/looking_around_08.png",
+];
+
 #[derive(Clone, Copy)]
 struct AnimationStep {
     frame: usize,
@@ -165,6 +198,111 @@ const PLAY_WITH_YARN_STEPS: [AnimationStep; 8] = [
     },
 ];
 
+const STRETCH_STEPS: [AnimationStep; 8] = [
+    AnimationStep {
+        frame: 0,
+        duration_ms: 220,
+    },
+    AnimationStep {
+        frame: 1,
+        duration_ms: 220,
+    },
+    AnimationStep {
+        frame: 2,
+        duration_ms: 240,
+    },
+    AnimationStep {
+        frame: 3,
+        duration_ms: 280,
+    },
+    AnimationStep {
+        frame: 4,
+        duration_ms: 420,
+    },
+    AnimationStep {
+        frame: 5,
+        duration_ms: 260,
+    },
+    AnimationStep {
+        frame: 6,
+        duration_ms: 220,
+    },
+    AnimationStep {
+        frame: 7,
+        duration_ms: 320,
+    },
+];
+
+const GROOMING_STEPS: [AnimationStep; 8] = [
+    AnimationStep {
+        frame: 0,
+        duration_ms: 260,
+    },
+    AnimationStep {
+        frame: 1,
+        duration_ms: 240,
+    },
+    AnimationStep {
+        frame: 2,
+        duration_ms: 280,
+    },
+    AnimationStep {
+        frame: 3,
+        duration_ms: 320,
+    },
+    AnimationStep {
+        frame: 4,
+        duration_ms: 300,
+    },
+    AnimationStep {
+        frame: 5,
+        duration_ms: 320,
+    },
+    AnimationStep {
+        frame: 6,
+        duration_ms: 260,
+    },
+    AnimationStep {
+        frame: 7,
+        duration_ms: 340,
+    },
+];
+
+const LOOKING_AROUND_STEPS: [AnimationStep; 8] = [
+    AnimationStep {
+        frame: 0,
+        duration_ms: 360,
+    },
+    AnimationStep {
+        frame: 1,
+        duration_ms: 260,
+    },
+    AnimationStep {
+        frame: 2,
+        duration_ms: 260,
+    },
+    AnimationStep {
+        frame: 3,
+        duration_ms: 360,
+    },
+    AnimationStep {
+        frame: 4,
+        duration_ms: 520,
+    },
+    AnimationStep {
+        frame: 5,
+        duration_ms: 280,
+    },
+    AnimationStep {
+        frame: 6,
+        duration_ms: 300,
+    },
+    AnimationStep {
+        frame: 7,
+        duration_ms: 400,
+    },
+];
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MiloState {
     #[default]
@@ -173,6 +311,9 @@ pub enum MiloState {
     Curious,
     Concerned,
     PlayWithYarn,
+    Stretch,
+    Grooming,
+    LookingAround,
 }
 
 impl MiloState {
@@ -182,7 +323,10 @@ impl MiloState {
             Self::Sleeping => Self::Curious,
             Self::Curious => Self::Concerned,
             Self::Concerned => Self::PlayWithYarn,
-            Self::PlayWithYarn => Self::Idle,
+            Self::PlayWithYarn => Self::Stretch,
+            Self::Stretch => Self::Grooming,
+            Self::Grooming => Self::LookingAround,
+            Self::LookingAround => Self::Idle,
         }
     }
 }
@@ -222,6 +366,9 @@ struct AnimationSets {
     curious: AnimationSet,
     concerned: AnimationSet,
     play_with_yarn: AnimationSet,
+    stretch: AnimationSet,
+    grooming: AnimationSet,
+    looking_around: AnimationSet,
 }
 
 impl AnimationSets {
@@ -232,6 +379,9 @@ impl AnimationSets {
             curious: load_animation_set(&CURIOUS_FRAME_PATHS, &CURIOUS_STEPS)?,
             concerned: load_animation_set(&CONCERNED_FRAME_PATHS, &CONCERNED_STEPS)?,
             play_with_yarn: load_animation_set(&PLAY_WITH_YARN_FRAME_PATHS, &PLAY_WITH_YARN_STEPS)?,
+            stretch: load_animation_set(&STRETCH_FRAME_PATHS, &STRETCH_STEPS)?,
+            grooming: load_animation_set(&GROOMING_FRAME_PATHS, &GROOMING_STEPS)?,
+            looking_around: load_animation_set(&LOOKING_AROUND_FRAME_PATHS, &LOOKING_AROUND_STEPS)?,
         })
     }
 
@@ -242,6 +392,9 @@ impl AnimationSets {
             MiloState::Curious => &self.curious,
             MiloState::Concerned => &self.concerned,
             MiloState::PlayWithYarn => &self.play_with_yarn,
+            MiloState::Stretch => &self.stretch,
+            MiloState::Grooming => &self.grooming,
+            MiloState::LookingAround => &self.looking_around,
         }
     }
 }
@@ -392,7 +545,10 @@ mod tests {
         assert_eq!(MiloState::Sleeping.next(), MiloState::Curious);
         assert_eq!(MiloState::Curious.next(), MiloState::Concerned);
         assert_eq!(MiloState::Concerned.next(), MiloState::PlayWithYarn);
-        assert_eq!(MiloState::PlayWithYarn.next(), MiloState::Idle);
+        assert_eq!(MiloState::PlayWithYarn.next(), MiloState::Stretch);
+        assert_eq!(MiloState::Stretch.next(), MiloState::Grooming);
+        assert_eq!(MiloState::Grooming.next(), MiloState::LookingAround);
+        assert_eq!(MiloState::LookingAround.next(), MiloState::Idle);
     }
 
     #[test]
@@ -408,11 +564,36 @@ mod tests {
     }
 
     #[test]
+    fn new_cozy_animations_use_all_frames_with_the_requested_timing() {
+        for (steps, expected) in [
+            (&STRETCH_STEPS, [220, 220, 240, 280, 420, 260, 220, 320]),
+            (&GROOMING_STEPS, [260, 240, 280, 320, 300, 320, 260, 340]),
+            (
+                &LOOKING_AROUND_STEPS,
+                [360, 260, 260, 360, 520, 280, 300, 400],
+            ),
+        ] {
+            assert_eq!((*steps).map(|step| step.frame), [0, 1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!((*steps).map(|step| step.duration_ms), expected);
+        }
+    }
+
+    #[test]
     fn finite_playback_completes_after_exactly_three_loops() {
         let mut countdown = LoopCountdown::new(3);
 
         assert!(!countdown.completed_loop());
         assert!(!countdown.completed_loop());
         assert!(countdown.completed_loop());
+    }
+
+    #[test]
+    fn finite_playback_supports_one_and_two_loop_activities() {
+        let mut one_loop = LoopCountdown::new(1);
+        assert!(one_loop.completed_loop());
+
+        let mut two_loops = LoopCountdown::new(2);
+        assert!(!two_loops.completed_loop());
+        assert!(two_loops.completed_loop());
     }
 }

@@ -4,7 +4,7 @@ use crate::distraction::{DistractionEvent, FIRST_THRESHOLD_SECONDS, SECOND_THRES
 use futures_channel::mpsc::{UnboundedSender, unbounded};
 use futures_util::StreamExt;
 use gtk4::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,9 +19,8 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 pub const DEVELOPMENT_IDLE_TIMEOUT_SECONDS: u32 = 60;
 pub const CURIOUS_AFTER_RESUME_MS: u64 = 3_000;
 pub const APP_SWITCH_CURIOUS_MS: u64 = 1_500;
-const PLAY_WITH_YARN_LOOPS: usize = 3;
-pub const COZY_ACTIVITY_MIN_DELAY_SECONDS: u64 = 120;
-pub const COZY_ACTIVITY_MAX_DELAY_SECONDS: u64 = 300;
+pub const COZY_ACTIVITY_MIN_DELAY_SECONDS: u64 = 50;
+pub const COZY_ACTIVITY_MAX_DELAY_SECONDS: u64 = 150;
 
 #[derive(Clone, Copy, Debug)]
 enum ActivityEvent {
@@ -38,6 +37,35 @@ enum CuriousReaction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CozyActivity {
     PlayWithYarn,
+    Stretch,
+    Grooming,
+    LookingAround,
+}
+
+impl CozyActivity {
+    const ALL: [Self; 4] = [
+        Self::PlayWithYarn,
+        Self::Stretch,
+        Self::Grooming,
+        Self::LookingAround,
+    ];
+
+    fn state(self) -> MiloState {
+        match self {
+            Self::PlayWithYarn => MiloState::PlayWithYarn,
+            Self::Stretch => MiloState::Stretch,
+            Self::Grooming => MiloState::Grooming,
+            Self::LookingAround => MiloState::LookingAround,
+        }
+    }
+
+    fn loops(self) -> usize {
+        match self {
+            Self::PlayWithYarn => 3,
+            Self::Stretch | Self::LookingAround => 1,
+            Self::Grooming => 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,24 +141,29 @@ impl BehaviorState {
         self.transition_to_automatic_state()
     }
 
-    fn start_autonomous_play_with_yarn(&mut self) -> Option<(StateTransition, u64)> {
+    fn start_autonomous_cozy_activity(
+        &mut self,
+        activity: CozyActivity,
+    ) -> Option<(StateTransition, u64)> {
         if !self.can_start_cozy_activity() {
             return None;
         }
 
         self.invalidate_temporary_state();
-        self.cozy_activity = Some(CozyActivity::PlayWithYarn);
+        self.cozy_activity = Some(activity);
         let generation = self.temporary_generation;
         let transition = self
-            .transition_to_state(MiloState::PlayWithYarn)
-            .expect("calm Idle must transition to PlayWithYarn");
+            .transition_to_state(activity.state())
+            .expect("a calm Idle state must transition to a cozy activity");
         Some((transition, generation))
     }
 
-    fn finish_play_with_yarn(&mut self, generation: u64) -> Option<StateTransition> {
-        if self.temporary_generation != generation
-            || self.cozy_activity != Some(CozyActivity::PlayWithYarn)
-        {
+    fn finish_cozy_activity(
+        &mut self,
+        activity: CozyActivity,
+        generation: u64,
+    ) -> Option<StateTransition> {
+        if self.temporary_generation != generation || self.cozy_activity != Some(activity) {
             return None;
         }
 
@@ -183,8 +216,8 @@ impl BehaviorState {
         self.curious_reaction == Some(CuriousReaction::AppSwitch)
     }
 
-    fn has_autonomous_cozy_activity(&self) -> bool {
-        self.cozy_activity.is_some()
+    fn active_cozy_activity(&self) -> Option<CozyActivity> {
+        self.cozy_activity
     }
 
     fn can_start_cozy_activity(&self) -> bool {
@@ -270,11 +303,11 @@ impl BehaviorState {
     }
 }
 
-struct CozyDelayGenerator {
+struct CozyRandomGenerator {
     state: u64,
 }
 
-impl CozyDelayGenerator {
+impl CozyRandomGenerator {
     fn from_system_time() -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -296,29 +329,53 @@ impl CozyDelayGenerator {
         }
     }
 
-    fn next_delay(&mut self) -> Duration {
+    fn next_value(&mut self) -> u64 {
         let mut value = self.state;
         value ^= value << 13;
         value ^= value >> 7;
         value ^= value << 17;
         self.state = value;
+        value
+    }
 
+    fn next_delay(&mut self) -> Duration {
         let delay_range = COZY_ACTIVITY_MAX_DELAY_SECONDS - COZY_ACTIVITY_MIN_DELAY_SECONDS + 1;
-        Duration::from_secs(COZY_ACTIVITY_MIN_DELAY_SECONDS + value % delay_range)
+        Duration::from_secs(COZY_ACTIVITY_MIN_DELAY_SECONDS + self.next_value() % delay_range)
+    }
+
+    fn next_activity(&mut self, previous: Option<CozyActivity>) -> CozyActivity {
+        let eligible_count = CozyActivity::ALL.len() - usize::from(previous.is_some());
+        let selected_index = self.next_value() as usize % eligible_count;
+        CozyActivity::ALL
+            .into_iter()
+            .filter(|activity| Some(*activity) != previous)
+            .nth(selected_index)
+            .expect("at least one cozy activity must remain eligible")
     }
 }
 
 struct CozyActivityScheduler {
     timeout: RefCell<Option<glib::SourceId>>,
-    delay_generator: RefCell<CozyDelayGenerator>,
+    random_generator: RefCell<CozyRandomGenerator>,
+    last_selected: Cell<Option<CozyActivity>>,
 }
 
 impl CozyActivityScheduler {
     fn new() -> Self {
         Self {
             timeout: RefCell::new(None),
-            delay_generator: RefCell::new(CozyDelayGenerator::from_system_time()),
+            random_generator: RefCell::new(CozyRandomGenerator::from_system_time()),
+            last_selected: Cell::new(None),
         }
+    }
+
+    fn select_activity(&self) -> CozyActivity {
+        let activity = self
+            .random_generator
+            .borrow_mut()
+            .next_activity(self.last_selected.get());
+        self.last_selected.set(Some(activity));
+        activity
     }
 }
 
@@ -380,7 +437,7 @@ impl BehaviorController {
 
     pub fn cycle_debug_state(&self) -> MiloState {
         self.clear_curious_timeout();
-        let interrupted = self.inner.state.borrow().has_autonomous_cozy_activity();
+        let interrupted = self.inner.state.borrow().active_cozy_activity();
         let transition = self.inner.state.borrow_mut().cycle_debug_state();
         self.apply_transition(Some(transition));
         self.handle_cozy_interruption(interrupted);
@@ -398,7 +455,7 @@ impl BehaviorController {
     }
 
     pub fn handle_distraction_event(&self, event: DistractionEvent) {
-        let interrupted = self.inner.state.borrow().has_autonomous_cozy_activity();
+        let interrupted = self.inner.state.borrow().active_cozy_activity();
         if self.inner.state.borrow().has_app_switch_reaction() {
             self.clear_curious_timeout();
         }
@@ -418,7 +475,9 @@ impl BehaviorController {
     }
 
     pub fn set_intervention_visible(&self, visible: bool) {
-        let interrupted = visible && self.inner.state.borrow().has_autonomous_cozy_activity();
+        let interrupted = visible
+            .then(|| self.inner.state.borrow().active_cozy_activity())
+            .flatten();
         let transition = self
             .inner
             .state
@@ -429,7 +488,9 @@ impl BehaviorController {
     }
 
     pub fn set_narrative_active(&self, active: bool) {
-        let interrupted = active && self.inner.state.borrow().has_autonomous_cozy_activity();
+        let interrupted = active
+            .then(|| self.inner.state.borrow().active_cozy_activity())
+            .flatten();
         let transition = self.inner.state.borrow_mut().set_narrative_active(active);
         self.apply_transition(transition);
         self.handle_cozy_interruption(interrupted);
@@ -439,7 +500,7 @@ impl BehaviorController {
         self.clear_curious_timeout();
         match event {
             ActivityEvent::Idled => {
-                let interrupted = self.inner.state.borrow().has_autonomous_cozy_activity();
+                let interrupted = self.inner.state.borrow().active_cozy_activity();
                 let transition = self.inner.state.borrow_mut().system_idle();
                 self.apply_transition(transition);
                 self.handle_cozy_interruption(interrupted);
@@ -454,7 +515,7 @@ impl BehaviorController {
 
     fn start_curious_reaction(&self, reaction: CuriousReaction, duration_ms: u64) {
         self.clear_curious_timeout();
-        let interrupted = self.inner.state.borrow().has_autonomous_cozy_activity();
+        let interrupted = self.inner.state.borrow().active_cozy_activity();
         let (generation, transition) = match reaction {
             CuriousReaction::Resume => self.inner.state.borrow_mut().resume(),
             CuriousReaction::AppSwitch => self.inner.state.borrow_mut().start_app_switch_reaction(),
@@ -491,17 +552,20 @@ impl BehaviorController {
         }
     }
 
-    fn play_autonomous_yarn(&self, generation: u64) {
+    fn play_autonomous_cozy_activity(&self, activity: CozyActivity, generation: u64) {
         let weak_inner = Rc::downgrade(&self.inner);
         self.inner
             .animator
-            .play_loops(MiloState::PlayWithYarn, PLAY_WITH_YARN_LOOPS, move || {
+            .play_loops(activity.state(), activity.loops(), move || {
                 let Some(inner) = weak_inner.upgrade() else {
                     return;
                 };
-                let transition = inner.state.borrow_mut().finish_play_with_yarn(generation);
+                let transition = inner
+                    .state
+                    .borrow_mut()
+                    .finish_cozy_activity(activity, generation);
                 if let Some(transition) = transition {
-                    eprintln!("[milo] cozy activity completed: PlayWithYarn");
+                    eprintln!("[milo] cozy activity completed: {activity:?}");
                     inner.animator.set_state(transition.current);
                     Self { inner }.schedule_next_cozy_opportunity();
                 }
@@ -516,10 +580,10 @@ impl BehaviorController {
         let delay = self
             .inner
             .cozy_scheduler
-            .delay_generator
+            .random_generator
             .borrow_mut()
             .next_delay();
-        eprintln!("[milo] cozy activity scheduled: PlayWithYarn");
+        eprintln!("[milo] cozy activity scheduled");
 
         let weak_inner = Rc::downgrade(&self.inner);
         let timeout = glib::timeout_add_local_once(delay, move || {
@@ -533,26 +597,32 @@ impl BehaviorController {
     }
 
     fn handle_cozy_opportunity(&self) {
+        if !self.inner.state.borrow().can_start_cozy_activity() {
+            self.schedule_next_cozy_opportunity();
+            return;
+        }
+
+        let activity = self.inner.cozy_scheduler.select_activity();
         let start = self
             .inner
             .state
             .borrow_mut()
-            .start_autonomous_play_with_yarn();
+            .start_autonomous_cozy_activity(activity);
         let Some((_transition, generation)) = start else {
             self.schedule_next_cozy_opportunity();
             return;
         };
 
-        eprintln!("[milo] cozy activity started: PlayWithYarn");
-        self.play_autonomous_yarn(generation);
+        eprintln!("[milo] cozy activity started: {activity:?}");
+        self.play_autonomous_cozy_activity(activity, generation);
     }
 
-    fn handle_cozy_interruption(&self, interrupted: bool) {
-        if !interrupted {
+    fn handle_cozy_interruption(&self, interrupted: Option<CozyActivity>) {
+        let Some(activity) = interrupted else {
             return;
-        }
+        };
 
-        eprintln!("[milo] cozy activity interrupted: PlayWithYarn");
+        eprintln!("[milo] cozy activity interrupted: {activity:?}");
         self.schedule_next_cozy_opportunity();
     }
 
@@ -661,9 +731,9 @@ mod tests {
         }
     }
 
-    fn start_autonomous_yarn(state: &mut BehaviorState) -> u64 {
-        let (transition, generation) = state.start_autonomous_play_with_yarn().unwrap();
-        assert_eq!(transition.current, MiloState::PlayWithYarn);
+    fn start_cozy_activity(state: &mut BehaviorState, activity: CozyActivity) -> u64 {
+        let (transition, generation) = state.start_autonomous_cozy_activity(activity).unwrap();
+        assert_eq!(transition.current, activity.state());
         generation
     }
 
@@ -795,12 +865,12 @@ mod tests {
     #[test]
     fn play_with_yarn_may_start_from_calm_authoritative_idle() {
         let mut state = BehaviorState::new();
-        let generation = start_autonomous_yarn(&mut state);
+        let generation = start_cozy_activity(&mut state, CozyActivity::PlayWithYarn);
 
         assert_eq!(state.current, MiloState::PlayWithYarn);
         assert_eq!(state.cozy_activity, Some(CozyActivity::PlayWithYarn));
         assert_eq!(
-            state.finish_play_with_yarn(generation),
+            state.finish_cozy_activity(CozyActivity::PlayWithYarn, generation),
             Some(StateTransition {
                 previous: MiloState::PlayWithYarn,
                 current: MiloState::Idle,
@@ -811,11 +881,11 @@ mod tests {
     #[test]
     fn play_with_yarn_completion_recomputes_authoritative_state() {
         let mut state = BehaviorState::new();
-        let generation = start_autonomous_yarn(&mut state);
+        let generation = start_cozy_activity(&mut state, CozyActivity::PlayWithYarn);
         state.distraction_severity = DistractionSeverity::Concerned;
 
         assert_eq!(
-            state.finish_play_with_yarn(generation),
+            state.finish_cozy_activity(CozyActivity::PlayWithYarn, generation),
             Some(StateTransition {
                 previous: MiloState::PlayWithYarn,
                 current: MiloState::Concerned,
@@ -828,7 +898,11 @@ mod tests {
         let mut state = BehaviorState::new();
         state.system_idle();
 
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
         assert_eq!(state.current, MiloState::Sleeping);
     }
 
@@ -839,7 +913,11 @@ mod tests {
             state.handle_distraction_event(started());
             state.handle_distraction_event(threshold(seconds));
 
-            assert!(state.start_autonomous_play_with_yarn().is_none());
+            assert!(
+                state
+                    .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                    .is_none()
+            );
             assert_eq!(
                 state.current,
                 if seconds == FIRST_THRESHOLD_SECONDS {
@@ -856,7 +934,11 @@ mod tests {
         let mut state = BehaviorState::new();
         state.handle_distraction_event(started());
 
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
         assert_eq!(state.current, MiloState::Idle);
     }
 
@@ -866,7 +948,11 @@ mod tests {
         state.system_idle();
         state.resume();
 
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
         assert_eq!(state.current, MiloState::Curious);
     }
 
@@ -875,7 +961,11 @@ mod tests {
         let mut state = BehaviorState::new();
         state.start_app_switch_reaction();
 
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
         assert_eq!(state.current, MiloState::Curious);
     }
 
@@ -883,30 +973,45 @@ mod tests {
     fn play_with_yarn_waits_for_intervention_and_narrative_ui() {
         let mut state = BehaviorState::new();
         state.set_intervention_visible(true);
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
 
         state.set_intervention_visible(false);
         state.set_narrative_active(true);
-        assert!(state.start_autonomous_play_with_yarn().is_none());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_none()
+        );
 
         state.set_narrative_active(false);
-        assert!(state.start_autonomous_play_with_yarn().is_some());
+        assert!(
+            state
+                .start_autonomous_cozy_activity(CozyActivity::PlayWithYarn)
+                .is_some()
+        );
     }
 
     #[test]
     fn system_idle_interrupts_play_with_yarn() {
         let mut state = BehaviorState::new();
-        let generation = start_autonomous_yarn(&mut state);
+        let generation = start_cozy_activity(&mut state, CozyActivity::PlayWithYarn);
 
         assert_eq!(state.system_idle().unwrap().current, MiloState::Sleeping);
-        assert_eq!(state.finish_play_with_yarn(generation), None);
+        assert_eq!(
+            state.finish_cozy_activity(CozyActivity::PlayWithYarn, generation),
+            None
+        );
         assert_eq!(state.current, MiloState::Sleeping);
     }
 
     #[test]
     fn distraction_concerned_interrupts_play_with_yarn() {
         let mut state = BehaviorState::new();
-        let generation = start_autonomous_yarn(&mut state);
+        let generation = start_cozy_activity(&mut state, CozyActivity::PlayWithYarn);
 
         assert_eq!(
             state
@@ -915,23 +1020,145 @@ mod tests {
                 .current,
             MiloState::Concerned
         );
-        assert_eq!(state.finish_play_with_yarn(generation), None);
+        assert_eq!(
+            state.finish_cozy_activity(CozyActivity::PlayWithYarn, generation),
+            None
+        );
         assert_eq!(state.current, MiloState::Concerned);
     }
 
     #[test]
     fn stale_play_with_yarn_completion_cannot_overwrite_concerned() {
         let mut state = BehaviorState::new();
-        let play_with_yarn_generation = start_autonomous_yarn(&mut state);
+        let play_with_yarn_generation = start_cozy_activity(&mut state, CozyActivity::PlayWithYarn);
         state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
 
-        assert_eq!(state.finish_play_with_yarn(play_with_yarn_generation), None);
+        assert_eq!(
+            state.finish_cozy_activity(CozyActivity::PlayWithYarn, play_with_yarn_generation),
+            None
+        );
         assert_eq!(state.current, MiloState::Concerned);
     }
 
     #[test]
+    fn cozy_activities_use_the_configured_loop_counts() {
+        assert_eq!(CozyActivity::PlayWithYarn.loops(), 3);
+        assert_eq!(CozyActivity::Stretch.loops(), 1);
+        assert_eq!(CozyActivity::Grooming.loops(), 2);
+        assert_eq!(CozyActivity::LookingAround.loops(), 1);
+    }
+
+    #[test]
+    fn every_cozy_activity_returns_to_authoritative_behavior() {
+        for activity in CozyActivity::ALL {
+            let mut state = BehaviorState::new();
+            let generation = start_cozy_activity(&mut state, activity);
+
+            assert_eq!(
+                state.finish_cozy_activity(activity, generation),
+                Some(StateTransition {
+                    previous: activity.state(),
+                    current: MiloState::Idle,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn every_cozy_activity_is_interrupted_by_system_idle() {
+        for activity in CozyActivity::ALL {
+            let mut state = BehaviorState::new();
+            let generation = start_cozy_activity(&mut state, activity);
+
+            assert_eq!(state.system_idle().unwrap().current, MiloState::Sleeping);
+            assert_eq!(state.finish_cozy_activity(activity, generation), None);
+            assert_eq!(state.current, MiloState::Sleeping);
+        }
+    }
+
+    #[test]
+    fn every_cozy_activity_is_interrupted_by_concerned() {
+        for activity in CozyActivity::ALL {
+            let mut state = BehaviorState::new();
+            let generation = start_cozy_activity(&mut state, activity);
+
+            assert_eq!(
+                state
+                    .handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS))
+                    .unwrap()
+                    .current,
+                MiloState::Concerned
+            );
+            assert_eq!(state.finish_cozy_activity(activity, generation), None);
+            assert_eq!(state.current, MiloState::Concerned);
+        }
+    }
+
+    #[test]
+    fn stale_cozy_completions_cannot_overwrite_authoritative_state() {
+        for activity in CozyActivity::ALL {
+            let mut state = BehaviorState::new();
+            let generation = start_cozy_activity(&mut state, activity);
+            state.handle_distraction_event(threshold(SECOND_THRESHOLD_SECONDS));
+
+            assert_eq!(state.finish_cozy_activity(activity, generation), None);
+            assert_eq!(state.current, MiloState::Concerned);
+        }
+    }
+
+    #[test]
+    fn intervention_and_narrative_prevent_every_cozy_activity() {
+        for activity in CozyActivity::ALL {
+            let mut intervention_state = BehaviorState::new();
+            intervention_state.set_intervention_visible(true);
+            assert!(
+                intervention_state
+                    .start_autonomous_cozy_activity(activity)
+                    .is_none()
+            );
+
+            let mut narrative_state = BehaviorState::new();
+            narrative_state.set_narrative_active(true);
+            assert!(
+                narrative_state
+                    .start_autonomous_cozy_activity(activity)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn random_selection_reaches_every_cozy_activity() {
+        let mut generator = CozyRandomGenerator::seeded(42);
+        let mut selected = Vec::new();
+        let mut previous = None;
+
+        for _ in 0..64 {
+            let activity = generator.next_activity(previous);
+            if !selected.contains(&activity) {
+                selected.push(activity);
+            }
+            previous = Some(activity);
+        }
+
+        assert_eq!(selected.len(), CozyActivity::ALL.len());
+    }
+
+    #[test]
+    fn random_selection_never_immediately_repeats_an_activity() {
+        let mut generator = CozyRandomGenerator::seeded(7);
+        let mut previous = None;
+
+        for _ in 0..64 {
+            let activity = generator.next_activity(previous);
+            assert_ne!(Some(activity), previous);
+            previous = Some(activity);
+        }
+    }
+
+    #[test]
     fn cozy_delays_are_varied_and_stay_within_development_bounds() {
-        let mut generator = CozyDelayGenerator::seeded(42);
+        let mut generator = CozyRandomGenerator::seeded(42);
         let delays = (0..16)
             .map(|_| generator.next_delay().as_secs())
             .collect::<Vec<_>>();
@@ -944,7 +1171,7 @@ mod tests {
 
     #[test]
     fn completion_policy_produces_another_randomized_opportunity() {
-        let mut generator = CozyDelayGenerator::seeded(7);
+        let mut generator = CozyRandomGenerator::seeded(7);
         let first_opportunity = generator.next_delay();
         let after_completion = generator.next_delay();
 

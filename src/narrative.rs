@@ -1,3 +1,4 @@
+use crate::world::{WorldEngine, WorldEvent, WorldObject, WorldProgress};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::env;
@@ -35,7 +36,7 @@ pub struct DialogueSequence {
 }
 
 impl DialogueSequence {
-    fn new(texts: &[&'static str]) -> Self {
+    pub(crate) fn new(texts: &[&'static str]) -> Self {
         Self {
             lines: texts
                 .iter()
@@ -60,6 +61,7 @@ struct NarrativeProgress {
     breaks_accepted: u32,
     return_dialogue_seen: bool,
     eli_revealed: bool,
+    world: WorldProgress,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -213,56 +215,115 @@ impl NarrativeStore {
 }
 
 type DialogueHandler = Rc<RefCell<Box<dyn FnMut(DialogueSequence)>>>;
+type WorldEventHandler = Rc<RefCell<Box<dyn FnMut(WorldEvent)>>>;
 
 #[derive(Clone)]
 pub struct NarrativeController {
     engine: Rc<RefCell<NarrativeEngine>>,
     store: Rc<NarrativeStore>,
     dialogue_handler: DialogueHandler,
+    world: Rc<RefCell<WorldEngine>>,
+    world_event_handler: WorldEventHandler,
 }
 
 impl NarrativeController {
-    pub fn load<F>(dialogue_handler: F) -> Self
+    pub fn load<F, G>(dialogue_handler: F, world_event_handler: G) -> Self
     where
         F: FnMut(DialogueSequence) + 'static,
+        G: FnMut(WorldEvent) + 'static,
     {
-        let (store, progress) = NarrativeStore::load();
-        Self {
+        let (store, mut progress) = NarrativeStore::load();
+        let mut world = WorldEngine::default();
+        let compatibility_event = reconcile_world_progress(&mut world, &mut progress);
+        if progress.world.is_visible(WorldObject::EliPhoto) {
+            eprintln!("[milo] world object visible: EliPhoto");
+        }
+        let controller = Self {
             engine: Rc::new(RefCell::new(NarrativeEngine::new(progress))),
             store: Rc::new(store),
             dialogue_handler: Rc::new(RefCell::new(Box::new(dialogue_handler))),
+            world: Rc::new(RefCell::new(world)),
+            world_event_handler: Rc::new(RefCell::new(Box::new(world_event_handler))),
+        };
+        if compatibility_event.is_some() {
+            controller.commit(None, compatibility_event);
         }
+        controller
     }
 
     pub fn first_launch(&self) {
         let update = self.engine.borrow_mut().first_launch();
-        self.handle_update(update);
+        self.commit(update, None);
     }
 
     pub fn became_concerned(&self) {
         let update = self.engine.borrow_mut().became_concerned();
-        self.handle_update(update);
+        self.commit(update, None);
     }
 
     pub fn break_accepted(&self) {
-        let update = self.engine.borrow_mut().break_accepted();
-        self.handle_update(Some(update));
+        let (update, world_event) = {
+            let mut engine = self.engine.borrow_mut();
+            let update = engine.break_accepted();
+            let world_event = apply_world_milestone(
+                &mut self.world.borrow_mut(),
+                &mut engine.progress,
+                update.milestone,
+            );
+            (update, world_event)
+        };
+        self.commit(Some(update), world_event);
     }
 
     pub fn system_idle(&self) {
-        self.engine.borrow_mut().system_idle();
+        let mut engine = self.engine.borrow_mut();
+        engine.system_idle();
+        self.world.borrow_mut().system_idle(&engine.progress.world);
     }
 
     pub fn system_resumed(&self) {
-        let update = self.engine.borrow_mut().system_resumed();
-        self.handle_update(update);
+        let (update, world_event) = {
+            let mut engine = self.engine.borrow_mut();
+            let update = engine.system_resumed();
+            let world_event = self
+                .world
+                .borrow_mut()
+                .system_resumed(&mut engine.progress.world);
+            (update, world_event)
+        };
+        self.commit(update, world_event);
     }
 
-    fn handle_update(&self, update: Option<NarrativeUpdate>) {
-        let Some(update) = update else {
-            return;
+    pub fn inspect_world_object(&self, object: WorldObject) {
+        let world_event = {
+            let mut engine = self.engine.borrow_mut();
+            self.world
+                .borrow_mut()
+                .inspect(&mut engine.progress.world, object)
         };
+        self.commit(None, world_event);
+    }
 
+    pub fn is_world_object_visible(&self, object: WorldObject) -> bool {
+        self.engine.borrow().progress.world.is_visible(object)
+    }
+
+    fn commit(&self, update: Option<NarrativeUpdate>, world_event: Option<WorldEvent>) {
+        if update.is_none() && world_event.is_none() {
+            return;
+        }
+
+        self.store.save(&self.engine.borrow().progress);
+
+        if let Some(update) = update {
+            self.handle_narrative_update(update);
+        }
+        if let Some(world_event) = world_event {
+            self.handle_world_event(world_event);
+        }
+    }
+
+    fn handle_narrative_update(&self, update: NarrativeUpdate) {
         eprintln!("[milo] narrative trigger: {:?}", update.trigger);
         if update.trigger == NarrativeTrigger::BreakAccepted {
             eprintln!(
@@ -273,10 +334,47 @@ impl NarrativeController {
         if let Some(milestone) = update.milestone {
             eprintln!("[milo] narrative milestone: {milestone:?}");
         }
-        self.store.save(&self.engine.borrow().progress);
         if let Some(dialogue) = update.dialogue {
             (self.dialogue_handler.borrow_mut())(dialogue);
         }
+    }
+
+    fn handle_world_event(&self, event: WorldEvent) {
+        match event {
+            WorldEvent::ObjectPending(WorldObject::EliPhoto) => {
+                eprintln!("[milo] world object pending: EliPhoto");
+            }
+            WorldEvent::EliPhotoAppeared => {
+                eprintln!("[milo] world event: EliPhotoAppeared");
+                eprintln!("[milo] world object visible: EliPhoto");
+            }
+            WorldEvent::ObjectInspected(WorldObject::EliPhoto) => {
+                eprintln!("[milo] world object inspected: EliPhoto");
+            }
+        }
+        (self.world_event_handler.borrow_mut())(event);
+    }
+}
+
+fn apply_world_milestone(
+    world: &mut WorldEngine,
+    progress: &mut NarrativeProgress,
+    milestone: Option<NarrativeMilestone>,
+) -> Option<WorldEvent> {
+    match milestone {
+        Some(NarrativeMilestone::EliRevealed) => world.eli_revealed(&mut progress.world),
+        None => None,
+    }
+}
+
+fn reconcile_world_progress(
+    world: &mut WorldEngine,
+    progress: &mut NarrativeProgress,
+) -> Option<WorldEvent> {
+    if progress.eli_revealed {
+        world.eli_revealed(&mut progress.world)
+    } else {
+        None
     }
 }
 
@@ -407,6 +505,7 @@ mod tests {
     #[test]
     fn third_break_reveals_eli_and_fourth_does_not_repeat_it() {
         let mut engine = NarrativeEngine::new(NarrativeProgress::default());
+        let mut world = WorldEngine::default();
         engine.break_accepted();
         engine.break_accepted();
 
@@ -421,6 +520,11 @@ mod tests {
         );
         assert_eq!(third.milestone, Some(NarrativeMilestone::EliRevealed));
         assert!(engine.progress.eli_revealed);
+        assert_eq!(
+            apply_world_milestone(&mut world, &mut engine.progress, third.milestone),
+            Some(WorldEvent::ObjectPending(WorldObject::EliPhoto))
+        );
+        assert!(!engine.progress.world.is_visible(WorldObject::EliPhoto));
 
         let fourth = engine.break_accepted();
         assert!(fourth.dialogue.is_none());
@@ -463,11 +567,40 @@ mod tests {
             breaks_accepted: 3,
             return_dialogue_seen: true,
             eli_revealed: true,
+            world: WorldProgress::default(),
         };
 
         let encoded = serde_json::to_vec(&expected).unwrap();
         let decoded: NarrativeProgress = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn chapter_one_progress_without_world_data_remains_compatible() {
+        let decoded = decode_progress_or_default(
+            br#"{
+                "introduction_seen": true,
+                "concerned_dialogue_seen": true,
+                "breaks_accepted": 3,
+                "return_dialogue_seen": true,
+                "eli_revealed": true
+            }"#,
+        );
+
+        assert!(decoded.introduction_seen);
+        assert!(decoded.concerned_dialogue_seen);
+        assert_eq!(decoded.breaks_accepted, 3);
+        assert!(decoded.return_dialogue_seen);
+        assert!(decoded.eli_revealed);
+        assert!(!decoded.world.is_visible(WorldObject::EliPhoto));
+
+        let mut world = WorldEngine::default();
+        let mut reconciled = decoded.clone();
+        assert_eq!(
+            reconcile_world_progress(&mut world, &mut reconciled),
+            Some(WorldEvent::ObjectPending(WorldObject::EliPhoto))
+        );
+        assert!(!reconciled.world.is_visible(WorldObject::EliPhoto));
     }
 
     #[test]

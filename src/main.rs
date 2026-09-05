@@ -5,6 +5,7 @@ mod browser_listener;
 mod distraction;
 mod intervention;
 mod narrative;
+mod world;
 
 use activity::start_hyprland_activity_monitor;
 use animation::MiloAnimator;
@@ -27,10 +28,20 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+use world::{WorldEvent, WorldObject};
 
 const APPLICATION_ID: &str = "com.milo.desktop";
 const WINDOW_TITLE: &str = "Milo";
 const MILO_DISPLAY_SIZE: i32 = 128;
+const MILO_WINDOW_WIDTH: i32 = 184;
+
+const ELI_PHOTO_APPEARANCE_DIALOGUE: &[&str] =
+    &["I left it here.", "Thought you might want to see it."];
+const ELI_PHOTO_INSPECTION_DIALOGUE: &[&str] = &[
+    "That's me.",
+    "The other name is Eli.",
+    "...I haven't seen this in a long time.",
+];
 
 fn main() -> gtk::glib::ExitCode {
     let debug_intervention =
@@ -94,6 +105,30 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
                 border-radius: 12px;
                 padding: 10px;
             }
+
+            button.eli-photo {
+                background-color: #eee5d4;
+                background-image: none;
+                border: 1px solid #b9aa91;
+                border-radius: 3px;
+                box-shadow: 0 2px 5px alpha(#000000, 0.28);
+                padding: 4px;
+            }
+
+            button.eli-photo:hover {
+                background-color: #f7efdf;
+            }
+
+            .eli-photo-image {
+                background-color: #706b64;
+                border: 1px solid #554f48;
+                border-radius: 1px;
+            }
+
+            .eli-photo-caption {
+                background-color: #c7baa4;
+                border-radius: 1px;
+            }
         "#,
     );
 
@@ -113,16 +148,22 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
         .css_classes(["milo-picture"])
         .build();
 
+    let world_view = WorldView::new();
+    let desktop = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    desktop.set_valign(gtk::Align::End);
+    desktop.append(&picture);
+    desktop.append(world_view.widget());
+
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(WINDOW_TITLE)
-        .default_width(MILO_DISPLAY_SIZE)
+        .default_width(MILO_WINDOW_WIDTH)
         .default_height(MILO_DISPLAY_SIZE)
         .decorated(false)
         .resizable(false)
         .focusable(false)
         .focus_on_click(false)
-        .child(&picture)
+        .child(&desktop)
         .build();
     window.add_css_class("milo-window");
 
@@ -134,12 +175,27 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let narrative_view = NarrativeView::new(&picture, move |active| {
         narrative_behavior.set_narrative_active(active);
     });
-    let presentation =
-        PresentationCoordinator::new(intervention_view.clone(), narrative_view, behavior.clone());
+    let presentation = PresentationCoordinator::new(
+        intervention_view.clone(),
+        narrative_view,
+        world_view.clone(),
+        behavior.clone(),
+    );
     let narrative_presentation = presentation.clone();
-    let narrative = NarrativeController::load(move |dialogue| {
-        narrative_presentation.enqueue_dialogue(dialogue);
-    });
+    let world_presentation = presentation.clone();
+    let narrative = NarrativeController::load(
+        move |dialogue| {
+            narrative_presentation.enqueue_dialogue(dialogue);
+        },
+        move |event| {
+            world_presentation.handle_world_event(event);
+        },
+    );
+    world_view.set_object_visible(
+        WorldObject::EliPhoto,
+        narrative.is_world_object_visible(WorldObject::EliPhoto),
+    );
+    world_view.connect_interaction(&narrative);
     let intervention_presentation = presentation.clone();
     let response_browser_bridge = browser_bridge.clone();
     let response_narrative = narrative.clone();
@@ -290,6 +346,7 @@ fn schedule_narrative_startup(
 struct PresentationCoordinator {
     intervention: InterventionView,
     narrative: NarrativeView,
+    world: WorldView,
     behavior: BehaviorController,
 }
 
@@ -297,11 +354,13 @@ impl PresentationCoordinator {
     fn new(
         intervention: InterventionView,
         narrative: NarrativeView,
+        world: WorldView,
         behavior: BehaviorController,
     ) -> Self {
         Self {
             intervention,
             narrative,
+            world,
             behavior,
         }
     }
@@ -323,6 +382,78 @@ impl PresentationCoordinator {
 
     fn enqueue_dialogue(&self, dialogue: DialogueSequence) {
         self.narrative.enqueue(dialogue);
+    }
+
+    fn handle_world_event(&self, event: WorldEvent) {
+        if event == WorldEvent::EliPhotoAppeared {
+            self.world.set_object_visible(WorldObject::EliPhoto, true);
+        }
+        if let Some(dialogue) = dialogue_for_world_event(event) {
+            self.enqueue_dialogue(dialogue);
+        }
+    }
+}
+
+fn dialogue_for_world_event(event: WorldEvent) -> Option<DialogueSequence> {
+    match event {
+        WorldEvent::ObjectPending(_) => None,
+        WorldEvent::EliPhotoAppeared => Some(DialogueSequence::new(ELI_PHOTO_APPEARANCE_DIALOGUE)),
+        WorldEvent::ObjectInspected(WorldObject::EliPhoto) => {
+            Some(DialogueSequence::new(ELI_PHOTO_INSPECTION_DIALOGUE))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WorldView {
+    eli_photo: gtk::Button,
+}
+
+impl WorldView {
+    fn new() -> Self {
+        let image = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        image.set_size_request(34, 34);
+        image.add_css_class("eli-photo-image");
+
+        let caption = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        caption.set_size_request(24, 3);
+        caption.set_halign(gtk::Align::Center);
+        caption.add_css_class("eli-photo-caption");
+
+        let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        card.append(&image);
+        card.append(&caption);
+
+        let eli_photo = gtk::Button::builder()
+            .tooltip_text("An old photograph")
+            .width_request(46)
+            .height_request(56)
+            .valign(gtk::Align::End)
+            .margin_bottom(8)
+            .child(&card)
+            .visible(false)
+            .build();
+        eli_photo.add_css_class("eli-photo");
+        eli_photo.set_focus_on_click(false);
+
+        Self { eli_photo }
+    }
+
+    fn widget(&self) -> &gtk::Button {
+        &self.eli_photo
+    }
+
+    fn set_object_visible(&self, object: WorldObject, visible: bool) {
+        match object {
+            WorldObject::EliPhoto => self.eli_photo.set_visible(visible),
+        }
+    }
+
+    fn connect_interaction(&self, narrative: &NarrativeController) {
+        let narrative = narrative.clone();
+        self.eli_photo.connect_clicked(move |_| {
+            narrative.inspect_world_object(WorldObject::EliPhoto);
+        });
     }
 }
 
@@ -483,6 +614,10 @@ fn browser_command_for_intervention_response(
 mod tests {
     use super::*;
 
+    fn dialogue_text(dialogue: DialogueSequence) -> Vec<&'static str> {
+        dialogue.into_lines().map(|line| line.text).collect()
+    }
+
     #[test]
     fn only_take_break_maps_to_a_browser_command() {
         assert_eq!(
@@ -505,6 +640,28 @@ mod tests {
         guard.cancel_pending();
         assert!(guard.try_schedule());
         assert!(!guard.try_schedule());
+    }
+
+    #[test]
+    fn world_events_map_to_the_expected_dialogue() {
+        assert_eq!(
+            dialogue_text(dialogue_for_world_event(WorldEvent::EliPhotoAppeared).unwrap()),
+            ["I left it here.", "Thought you might want to see it."]
+        );
+        assert_eq!(
+            dialogue_text(
+                dialogue_for_world_event(WorldEvent::ObjectInspected(WorldObject::EliPhoto))
+                    .unwrap()
+            ),
+            [
+                "That's me.",
+                "The other name is Eli.",
+                "...I haven't seen this in a long time."
+            ]
+        );
+        assert!(
+            dialogue_for_world_event(WorldEvent::ObjectPending(WorldObject::EliPhoto)).is_none()
+        );
     }
 }
 

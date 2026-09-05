@@ -1,8 +1,9 @@
 # Milo
 
 Milo is a minimal native Wayland desktop companion for GTK4 and Hyprland. It
-displays illustrated Idle, Sleeping, Curious, Concerned, and PlayWithYarn
-animations in a transparent, undecorated, small normal Wayland toplevel window.
+displays illustrated Idle, Sleeping, Curious, Concerned, PlayWithYarn, Stretch,
+Grooming, and LookingAround animations in a transparent, undecorated, small
+normal Wayland toplevel window.
 
 ## Native dependency
 
@@ -68,9 +69,9 @@ hyprctl clients
 ```
 
 Drag Milo with the left mouse button. For development, right-click Milo to
-cycle through Idle, Sleeping, Curious, Concerned, PlayWithYarn, and back to
-Idle. The selected state is printed in the launching terminal. Press Ctrl+C
-there to quit.
+cycle through Idle, Sleeping, Curious, Concerned, PlayWithYarn, Stretch,
+Grooming, LookingAround, and back to Idle. The selected state is printed in the
+launching terminal. Press Ctrl+C there to quit.
 
 While Milo is running, focus applications in different activity categories to
 see the context transition and visual reaction:
@@ -93,38 +94,52 @@ Concerned uses the four normalized frames in `assets/milo/concerned/`, looping
 with per-frame durations of 500, 400, 650, and 400 milliseconds through the
 same animation player as the other states.
 
-PlayWithYarn is an additional cozy, non-critical state. Its eight unchanged
-384 × 512 frames in `assets/milo/play_yarn/` run at 180, 180, 180, 220, 180,
-220, 220, and 260 milliseconds. A small cozy scheduler arms its first
-opportunity 120–300 seconds after startup and chooses a new randomized delay
-after every completed, interrupted, or rejected opportunity. It uses a
-lightweight time- and process-seeded generator and does not add a randomness
-dependency or use a fixed repeating interval.
+Four cozy, non-critical activities use eight unchanged 384 × 512 frames each:
+
+- PlayWithYarn: 180, 180, 180, 220, 180, 220, 220, and 260 milliseconds;
+  three loops.
+- Stretch: 220, 220, 240, 280, 420, 260, 220, and 320 milliseconds; one loop.
+- Grooming: 260, 240, 280, 320, 300, 320, 260, and 340 milliseconds; two loops.
+- LookingAround: 360, 260, 260, 360, 520, 280, 300, and 400 milliseconds; one
+  loop.
+
+One cozy scheduler arms its first opportunity 120–300 seconds after startup
+and chooses a new randomized delay after every completed, interrupted, or
+rejected opportunity. At an eligible opportunity it chooses approximately
+equally among all four activities while excluding the last selected activity,
+so consecutive cozy runs do not repeat. The last choice is in-memory only. The
+same lightweight time- and process-seeded generator supplies both choices and
+delays without adding a randomness dependency or a fixed repeating interval.
 
 An autonomous opportunity starts only from calm authoritative Idle: the system
 is awake, no distraction or Curious reaction is active, neither intervention
 nor narrative UI is active, and no debug state is being displayed. Autonomous
-PlayWithYarn runs exactly three complete loops (4,920 milliseconds) without a
+Each autonomous activity runs for its configured complete loop count without a
 separate completion timer. The animation player then notifies the behavior
 controller, which recomputes Sleeping, Curious, Concerned, or Idle from current
-conditions. Any real behavior or UI event interrupts it immediately, and a
-generation guard prevents stale completion from overwriting the newer state.
+conditions. Any real behavior or UI event interrupts the active cozy activity
+immediately, and a generation guard prevents stale completion from overwriting
+the newer state.
 
-Right-click PlayWithYarn remains manually inspectable: the debug version loops
-until another right-click advances to Idle or a real behavior event takes
-control. It does not emit cozy scheduler start/completion events.
+All four cozy animations remain manually inspectable in the right-click cycle.
+Debug versions loop until another right-click advances the cycle or a real
+behavior event takes control. They do not emit cozy scheduler start/completion
+events or narrative triggers.
 
 ### Manual cozy-activity test
 
 1. Start Milo and work normally without Shorts/Reels or right-clicking it.
-2. Confirm the scheduler logs one future PlayWithYarn opportunity and Milo does
-   not start playing immediately.
-3. Within roughly 2–5 calm minutes, confirm autonomous PlayWithYarn starts,
-   runs three loops for about five seconds, and returns naturally to Idle.
-4. During a later autonomous run, trigger system idle and confirm Milo switches
+2. Confirm one future cozy opportunity is scheduled and Milo does not start an
+   activity immediately.
+3. Over several calm opportunities, confirm Milo selects different activities
+   from PlayWithYarn, Stretch, Grooming, and LookingAround without immediately
+   repeating one.
+4. Confirm each activity completes after its configured loops and returns
+   naturally to Idle.
+5. During a later autonomous run, trigger system idle and confirm Milo switches
    immediately to Sleeping without a delayed return to Idle.
-5. Repeat with a distraction reaching Curious or Concerned and confirm the
-   authoritative distraction animation wins immediately.
+6. Repeat with distraction severity or an intervention and confirm the
+   authoritative behavior wins immediately.
 
 ## Automatic idle behavior
 
@@ -349,7 +364,7 @@ alter intervention eligibility.
 10. Resume and confirm Sleeping -> temporary Curious -> Idle; the previous
     Concerned state and intervention must not return.
 11. Right-click repeatedly and confirm the debug cycle still includes
-    Concerned and PlayWithYarn without answering the intervention.
+    Concerned and all four cozy animations without answering the intervention.
 
 ### Manual browser-command tests
 
@@ -373,9 +388,9 @@ system idle followed by resume. It does not access GTK, animation state,
 Firefox, or either browser transport. In particular, right-clicking to cycle
 Milo to Concerned does not emit a narrative trigger.
 
-Narrative progress contains only `introduction_seen`,
-`concerned_dialogue_seen`, `breaks_accepted`, `return_dialogue_seen`, and
-`eli_revealed`. It is stored as JSON at:
+Narrative progress contains `introduction_seen`, `concerned_dialogue_seen`,
+`breaks_accepted`, `return_dialogue_seen`, and `eli_revealed`, plus a small
+nested `world` record for the photograph. It is stored as JSON at:
 
 ```text
 $XDG_STATE_HOME/bloomaway/narrative.json
@@ -417,7 +432,62 @@ The initial narrative content is deliberately limited to:
   `...Eli.`
 
 The third break sets `eli_revealed`; later breaks increment the persisted count
-without adding new dialogue yet.
+without adding new dialogue yet. Existing Chapter 1 progress files without a
+`world` record remain valid. If such a file already has `eli_revealed`, Milo
+migrates it to a pending, still-hidden photograph rather than skipping the new
+away-cycle reveal.
+
+## The Photograph
+
+`world.rs` is a deliberately small world-object layer. It currently knows only
+`WorldObject::EliPhoto`, its persistent progress flags, and semantic events; it
+does not know about GTK, animation, distraction sessions, Firefox, or Native
+Messaging. The world fields are stored inside the existing narrative JSON:
+
+- `eli_photo_pending`
+- `eli_photo_visible`
+- `eli_photo_inspected`
+- `eli_photo_appearance_dialogue_seen`
+
+The third accepted break marks the photograph pending and saves that state, but
+does not show it. Once pending, only an authoritative system-idle event followed
+by resume can emit `WorldEvent::EliPhotoAppeared`. Browser tab closure, ordinary
+application switching, elapsed wall time, and cozy activities do not count as
+an away cycle. The appeared event persists visibility before the application
+layer reveals the GTK object and queues `I left it here.` followed by `Thought
+you might want to see it.` This appearance happens once; after restart the photo
+is restored directly from persisted visibility and the dialogue is not
+replayed.
+
+The GTK window uses a compact horizontal container: Milo keeps his existing
+128-pixel picture and a 46-by-56-pixel paper-card placeholder sits beside him
+only after it is unlocked. The placeholder is a normal button with replaceable
+child content, so final transparent artwork can be introduced without changing
+world logic. Clicking it for the first time persists inspection and queues
+`That's me.`, `The other name is Eli.`, and `...I haven't seen this in a long
+time.` Later clicks intentionally do nothing.
+
+World dialogue goes through the existing narrative queue. An intervention
+therefore remains highest priority and temporarily hides/pauses dialogue rather
+than allowing popovers to overlap. Narrative activity may interrupt any
+autonomous cozy activity through the existing presentation priority, but
+clicking the photo does not directly choose an animation state or change cozy
+scheduling.
+
+### Manual Photograph test
+
+1. Reach the third accepted break. Confirm its existing Eli dialogue and the
+   `world object pending: EliPhoto` log, with no photograph visible.
+2. Restart Milo if desired; confirm the photograph remains pending and hidden.
+3. Let the real system-idle timeout fire, then resume. Confirm the
+   `EliPhotoAppeared` and visible logs, the small card beside Milo, and the two
+   appearance lines.
+4. Restart Milo. Confirm the photograph remains visible and the appearance
+   lines do not replay.
+5. Click the photograph. Confirm the three inspection lines and the
+   `world object inspected: EliPhoto` log.
+6. Restart and click again. Confirm the photograph remains visible and the
+   inspection sequence does not replay.
 
 ### Manual narrative test
 
@@ -435,8 +505,9 @@ without adding new dialogue yet.
    sequence appears once. Confirm ordinary idle/resume without a preceding
    accepted break produces no return dialogue.
 5. Accept second and third breaks in fresh distraction sessions and confirm
-   their sequences, including the name `Eli`. Restart Milo and verify the
-   progress does not repeat earlier milestones.
+   their sequences, including the name `Eli`. Confirm the photograph is only
+   pending until a real idle/resume cycle. Restart Milo and verify the progress
+   does not repeat earlier milestones.
 
 ## How dragging works
 
@@ -449,6 +520,6 @@ movement until release. Milo contains no pointer-motion loop, coordinate
 calculation, layer-shell margins, or `hyprctl` movement commands.
 
 The transparent surface still receives pointer input; transparent-pixel
-click-through is not implemented. Milo persists only the small narrative
-progress record described above. It has no persisted browser URLs, productivity
-scoring, blocking, or automated movement behavior.
+click-through is not implemented. Milo persists only the small narrative and
+world progress record described above. It has no persisted browser URLs,
+productivity scoring, blocking, or automated movement behavior.
