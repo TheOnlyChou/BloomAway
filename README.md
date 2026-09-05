@@ -1,8 +1,8 @@
 # Milo
 
 Milo is a minimal native Wayland desktop companion for GTK4 and Hyprland. It
-displays illustrated Idle, Sleeping, Curious, and Concerned animations in a
-transparent, undecorated, small normal Wayland toplevel window.
+displays illustrated Idle, Sleeping, Curious, Concerned, and PlayWithYarn
+animations in a transparent, undecorated, small normal Wayland toplevel window.
 
 ## Native dependency
 
@@ -68,8 +68,9 @@ hyprctl clients
 ```
 
 Drag Milo with the left mouse button. For development, right-click Milo to
-cycle through Idle, Sleeping, Curious, Concerned, and back to Idle. The selected
-state is printed in the launching terminal. Press Ctrl+C there to quit.
+cycle through Idle, Sleeping, Curious, Concerned, PlayWithYarn, and back to
+Idle. The selected state is printed in the launching terminal. Press Ctrl+C
+there to quit.
 
 While Milo is running, focus applications in different activity categories to
 see the context transition and visual reaction:
@@ -81,8 +82,8 @@ see the context transition and visual reaction:
 
 ## Animation states
 
-All four transparent PNG frames for each state under `assets/milo/` are loaded
-once as GDK textures. Milo starts in Idle. Each state owns its frame order and
+All transparent PNG frames for each state under `assets/milo/` are loaded once
+as GDK textures. Milo starts in Idle. Each state owns its frame order and
 per-frame durations, and changing state resets that animation to its first
 frame and replaces its GLib one-shot timeout. A single `GtkPicture` displays
 every state at 128 × 128 logical pixels with aspect-preserving smooth scaling,
@@ -91,6 +92,39 @@ so neither the picture nor the window changes size during a switch.
 Concerned uses the four normalized frames in `assets/milo/concerned/`, looping
 with per-frame durations of 500, 400, 650, and 400 milliseconds through the
 same animation player as the other states.
+
+PlayWithYarn is an additional cozy, non-critical state. Its eight unchanged
+384 × 512 frames in `assets/milo/play_yarn/` run at 180, 180, 180, 220, 180,
+220, 220, and 260 milliseconds. A small cozy scheduler arms its first
+opportunity 120–300 seconds after startup and chooses a new randomized delay
+after every completed, interrupted, or rejected opportunity. It uses a
+lightweight time- and process-seeded generator and does not add a randomness
+dependency or use a fixed repeating interval.
+
+An autonomous opportunity starts only from calm authoritative Idle: the system
+is awake, no distraction or Curious reaction is active, neither intervention
+nor narrative UI is active, and no debug state is being displayed. Autonomous
+PlayWithYarn runs exactly three complete loops (4,920 milliseconds) without a
+separate completion timer. The animation player then notifies the behavior
+controller, which recomputes Sleeping, Curious, Concerned, or Idle from current
+conditions. Any real behavior or UI event interrupts it immediately, and a
+generation guard prevents stale completion from overwriting the newer state.
+
+Right-click PlayWithYarn remains manually inspectable: the debug version loops
+until another right-click advances to Idle or a real behavior event takes
+control. It does not emit cozy scheduler start/completion events.
+
+### Manual cozy-activity test
+
+1. Start Milo and work normally without Shorts/Reels or right-clicking it.
+2. Confirm the scheduler logs one future PlayWithYarn opportunity and Milo does
+   not start playing immediately.
+3. Within roughly 2–5 calm minutes, confirm autonomous PlayWithYarn starts,
+   runs three loops for about five seconds, and returns naturally to Idle.
+4. During a later autonomous run, trigger system idle and confirm Milo switches
+   immediately to Sleeping without a delayed return to Idle.
+5. Repeat with a distraction reaching Curious or Concerned and confirm the
+   authoritative distraction animation wins immediately.
 
 ## Automatic idle behavior
 
@@ -315,7 +349,7 @@ alter intervention eligibility.
 10. Resume and confirm Sleeping -> temporary Curious -> Idle; the previous
     Concerned state and intervention must not return.
 11. Right-click repeatedly and confirm the debug cycle still includes
-    Concerned without answering the intervention.
+    Concerned and PlayWithYarn without answering the intervention.
 
 ### Manual browser-command tests
 

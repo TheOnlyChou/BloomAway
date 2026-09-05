@@ -130,8 +130,12 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let behavior = BehaviorController::new(animator);
     let browser_bridge = BrowserBridge::new();
     let intervention_view = InterventionView::new(&picture);
-    let narrative_view = NarrativeView::new(&picture);
-    let presentation = PresentationCoordinator::new(intervention_view.clone(), narrative_view);
+    let narrative_behavior = behavior.clone();
+    let narrative_view = NarrativeView::new(&picture, move |active| {
+        narrative_behavior.set_narrative_active(active);
+    });
+    let presentation =
+        PresentationCoordinator::new(intervention_view.clone(), narrative_view, behavior.clone());
     let narrative_presentation = presentation.clone();
     let narrative = NarrativeController::load(move |dialogue| {
         narrative_presentation.enqueue_dialogue(dialogue);
@@ -210,11 +214,12 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
         BrowserActivityEvent::Unavailable => distraction.browser_unavailable(),
     });
     setup_native_drag(&window);
-    setup_debug_state_switch(&window, behavior);
+    setup_debug_state_switch(&window, behavior.clone());
 
     window.present();
     eprintln!("[milo] GTK: window presented");
     setup_narrative_startup(&picture, narrative);
+    behavior.start_cozy_activity_scheduler();
 
     if debug_intervention {
         let debug_presentation = presentation.clone();
@@ -285,25 +290,33 @@ fn schedule_narrative_startup(
 struct PresentationCoordinator {
     intervention: InterventionView,
     narrative: NarrativeView,
+    behavior: BehaviorController,
 }
 
 impl PresentationCoordinator {
-    fn new(intervention: InterventionView, narrative: NarrativeView) -> Self {
+    fn new(
+        intervention: InterventionView,
+        narrative: NarrativeView,
+        behavior: BehaviorController,
+    ) -> Self {
         Self {
             intervention,
             narrative,
+            behavior,
         }
     }
 
     fn present_intervention(&self, presentation: InterventionPresentation) {
         match presentation {
             InterventionPresentation::Show(_) => {
+                self.behavior.set_intervention_visible(true);
                 self.narrative.set_intervention_visible(true);
                 self.intervention.present(presentation);
             }
             InterventionPresentation::Hide => {
                 self.intervention.present(presentation);
                 self.narrative.set_intervention_visible(false);
+                self.behavior.set_intervention_visible(false);
             }
         }
     }
@@ -319,12 +332,16 @@ struct NarrativeViewState {
     current_line: Option<DialogueLine>,
     timeout: Option<gtk::glib::SourceId>,
     intervention_visible: bool,
+    active: bool,
 }
+
+type NarrativeActivityHandler = RefCell<Box<dyn FnMut(bool)>>;
 
 struct NarrativeViewInner {
     popover: gtk::Popover,
     label: gtk::Label,
     state: RefCell<NarrativeViewState>,
+    activity_handler: NarrativeActivityHandler,
 }
 
 #[derive(Clone)]
@@ -333,7 +350,10 @@ struct NarrativeView {
 }
 
 impl NarrativeView {
-    fn new(anchor: &gtk::Picture) -> Self {
+    fn new<F>(anchor: &gtk::Picture, activity_handler: F) -> Self
+    where
+        F: FnMut(bool) + 'static,
+    {
         let label = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .wrap(true)
@@ -354,16 +374,30 @@ impl NarrativeView {
                 popover,
                 label,
                 state: RefCell::new(NarrativeViewState::default()),
+                activity_handler: RefCell::new(Box::new(activity_handler)),
             }),
         }
     }
 
     fn enqueue(&self, dialogue: DialogueSequence) {
-        self.inner
-            .state
-            .borrow_mut()
-            .queued_lines
-            .extend(dialogue.into_lines());
+        let mut lines = dialogue.into_lines().peekable();
+        if lines.peek().is_none() {
+            return;
+        }
+
+        let became_active = {
+            let mut state = self.inner.state.borrow_mut();
+            state.queued_lines.extend(lines);
+            if state.active {
+                false
+            } else {
+                state.active = true;
+                true
+            }
+        };
+        if became_active {
+            (self.inner.activity_handler.borrow_mut())(true);
+        }
         self.show_next_line();
     }
 
@@ -394,7 +428,13 @@ impl NarrativeView {
                 Some(line) => (line, false),
                 None => {
                     let Some(line) = state.queued_lines.pop_front() else {
+                        let became_inactive = state.active;
+                        state.active = false;
+                        drop(state);
                         self.inner.popover.popdown();
+                        if became_inactive {
+                            (self.inner.activity_handler.borrow_mut())(false);
+                        }
                         return;
                     };
                     state.current_line = Some(line);
