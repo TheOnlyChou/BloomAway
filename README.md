@@ -2,8 +2,8 @@
 
 Milo is a minimal native Wayland desktop companion for GTK4 and Hyprland. It
 displays illustrated Idle, Sleeping, Curious, Concerned, PlayWithYarn, Stretch,
-Grooming, and LookingAround animations in a transparent, undecorated, small
-normal Wayland toplevel window.
+Grooming, and LookingAround animations inside a compact room scene in a
+transparent, undecorated normal Wayland toplevel window.
 
 ## Native dependency
 
@@ -62,6 +62,15 @@ From this directory, in a running Hyprland session:
 cargo run
 ```
 
+This is the practical default: a compact transparent companion containing Milo
+and any visible small world objects. To open the optional room presentation:
+
+```bash
+cargo run -- --room
+```
+
+`cargo run -- --transparent` is an explicit alias for the default mode.
+
 Inspect the mapped window and its class with:
 
 ```bash
@@ -81,14 +90,68 @@ see the context transition and visual reaction:
 [milo] reaction: Curious
 ```
 
+## Presentation modes
+
+`PresentationMode` is a window-only choice and is separate from `MiloState` and
+cozy activities. Both modes construct one GTK window around the same animator,
+world view, narrative system, intervention controller, and browser behavior.
+
+`TransparentCompanion`, the default, uses the original compact 184 × 128
+layout. Milo remains 128 × 128, no room image is loaded, and a visible EliPhoto
+sits directly beside him. The transparent surface does not retain the room
+viewport or its large hit area.
+
+`Room` uses a 400 × 260 viewport. The 1536 × 1024 artwork at
+`assets/world/room/milo_room.png` is painted into that allocation with a stable,
+centered Cover calculation and Cairo's best-quality filter. The source pixbuf
+never participates in GTK measurement: an explicitly sized `GtkDrawingArea`
+owns the allocation, so the source image cannot enlarge the window. The slight
+center crop preserves the rug, bed, bookshelf, and warm back wall. The image is
+clipped to a 22-pixel rounded rectangle with a thin warm border, while the GTK
+toplevel remains transparent outside the corners.
+
+In Room mode, a `GtkOverlay` places a `GtkFixed` world-content layer above the
+non-targetable background. Milo uses an 88 × 88 widget fixed at `(122, 149)` on
+the lower center-left of the rug. EliPhoto is fixed at `(239, 179)` on the rug
+to Milo's right. Both placements share a 237-pixel floor baseline, so animation
+source dimensions cannot move Milo's widget or resize the window. The fixed
+layer leaves clear room for later objects without introducing a scene graph.
+
+The room drawing cannot receive pointer events. EliPhoto remains its own button,
+while clicks on Milo and passive world space continue bubbling to the
+window-level native Wayland drag gesture and the right-click debug cycle.
+Narrative, intervention, and enlarged-photo popovers remain anchored to their
+existing foreground widgets and use opaque warm-dark surfaces for contrast.
+Presentation mode changes no narrative, world progress, cozy scheduling, or
+browser behavior.
+
+### Manual room test
+
+1. Run `cargo run` and confirm Milo appears in a compact transparent 184 × 128
+   window with no room background or large invisible input area.
+2. Run `cargo run -- --room` and confirm the cropped room appears in a compact
+   400 × 260 window with clean rounded corners.
+3. In both modes, right-click through Idle, Sleeping, Curious, Concerned,
+   PlayWithYarn, Stretch, Grooming, and LookingAround. Confirm Milo stays on the
+   same rug baseline in Room mode and neither window resizes between states.
+4. Drag from Milo and passive room space, then confirm EliPhoto remains
+   independently clickable.
+5. Open EliPhoto and trigger normal narrative and the debug intervention as
+   needed. Confirm the enlarged photograph and both popover types remain
+   readable above the room.
+6. Exercise Firefox tracking and a distraction session and confirm the existing
+   behavior is unchanged.
+
 ## Animation states
 
 All transparent PNG frames for each state under `assets/milo/` are loaded once
 as GDK textures. Milo starts in Idle. Each state owns its frame order and
 per-frame durations, and changing state resets that animation to its first
 frame and replaces its GLib one-shot timeout. A single `GtkPicture` displays
-every state at 128 × 128 logical pixels with aspect-preserving smooth scaling,
-so neither the picture nor the window changes size during a switch.
+every state with aspect-preserving smooth scaling: 128 × 128 logical pixels in
+TransparentCompanion and 88 × 88 in Room. Its allocation is fixed for the
+selected presentation, so neither the picture nor the window changes size
+during an animation switch.
 
 Concerned uses the four normalized frames in `assets/milo/concerned/`, looping
 with per-frame durations of 500, 400, 650, and 400 milliseconds through the
@@ -460,19 +523,48 @@ is restored directly from persisted visibility and the dialogue is not
 replayed.
 
 The GTK window uses a compact horizontal container: Milo keeps his existing
-128-pixel picture and a 46-by-56-pixel paper-card placeholder sits beside him
-only after it is unlocked. The placeholder is a normal button with replaceable
-child content, so final transparent artwork can be introduced without changing
-world logic. Clicking it for the first time persists inspection and queues
-`That's me.`, `The other name is Eli.`, and `...I haven't seen this in a long
-time.` Later clicks intentionally do nothing.
+128-pixel picture and the supplied 384 × 480 transparent thumbnail sits in a
+46-by-58-pixel button beside him only after it is unlocked. `GtkPicture` uses
+`Contain`, preserving the old photograph's portrait aspect ratio without
+cropping or distortion. The final artwork is loaded once as a GDK texture; no
+text, recoloring, or other composition changes are applied.
 
-World dialogue goes through the existing narrative queue. An intervention
-therefore remains highest priority and temporarily hides/pauses dialogue rather
-than allowing popovers to overlap. Narrative activity may interrupt any
-autonomous cozy activity through the existing presentation priority, but
-clicking the photo does not directly choose an animation state or change cozy
-scheduling.
+Clicking the thumbnail opens an autohiding `GtkPopover` containing the supplied
+1122 × 1402 full photograph at up to 320 × 400 logical pixels. This keeps the
+main Milo window compact, while outside-click dismissal returns to the normal
+desktop companion without affecting dragging. An intervention closes an open
+inspection and prevents new inspection while visible; an already active
+narrative sequence also prevents the lower-priority passive click.
+
+The first successful click opens the full photograph, persists inspection, and
+uses the existing narrative queue for `That's me.`, `And that's Eli.`, `We used
+to play with that all the time.`, and `...I haven't seen him in a long time.`
+Later clicks continue to reopen the enlarged photograph without replaying the
+emotional sequence. The yarn in the supplied artwork connects their friendship
+to PlayWithYarn narratively; no cozy behavior or selection probability changes.
+
+World dialogue goes through the existing narrative queue and line timer. Each
+queued sequence carries only a presentation target: ordinary lines use Milo's
+existing bubble, while first-inspection lines use a caption below the enlarged
+photograph. `PhotoInspection` is therefore a rendering context, not a
+suppression condition or a second narrative engine. The photograph stays open
+between caption lines and after the sequence finishes.
+
+An intervention remains the sole higher-priority presentation. It cancels the
+current line timer, hides the current target, and retains that exact line. The
+intervention popover's GTK `closed` lifecycle signal clears suppression and
+immediately pumps the queue, so the retained line resumes without advancing or
+restarting its sequence. This also lets a `BreakAccepted` sequence queued while
+the intervention is visible begin as soon as the intervention has actually
+closed. Recording the accepted break is independent of Firefox command
+delivery; the tab-close request is dispatched afterward on the GLib main
+context and a missing browser bridge cannot discard dialogue.
+
+Concise presentation logs report sequence queueing, intervention suppression,
+pause/resume, presentation target, current dialogue, and popover show/hide.
+Narrative activity may still interrupt an autonomous cozy activity through the
+existing presentation priority, but clicking the photo does not directly choose
+an animation state or change cozy scheduling.
 
 ### Manual Photograph test
 
@@ -480,14 +572,17 @@ scheduling.
    `world object pending: EliPhoto` log, with no photograph visible.
 2. Restart Milo if desired; confirm the photograph remains pending and hidden.
 3. Let the real system-idle timeout fire, then resume. Confirm the
-   `EliPhotoAppeared` and visible logs, the small card beside Milo, and the two
-   appearance lines.
+   `EliPhotoAppeared` and visible logs, the final thumbnail beside Milo, and the
+   two appearance lines.
 4. Restart Milo. Confirm the photograph remains visible and the appearance
    lines do not replay.
-5. Click the photograph. Confirm the three inspection lines and the
-   `world object inspected: EliPhoto` log.
-6. Restart and click again. Confirm the photograph remains visible and the
-   inspection sequence does not replay.
+5. Click the photograph. Confirm the larger full artwork opens, the four
+   inspection lines appear in order, and the `world object inspected: EliPhoto`
+   log is emitted.
+6. Dismiss the popover by clicking outside, then click the photograph again.
+   Confirm the full artwork reopens without replaying the inspection sequence.
+7. Restart and confirm the photograph remains visible and reopenable without
+   replaying the inspection sequence.
 
 ### Manual narrative test
 
@@ -498,9 +593,10 @@ scheduling.
 2. Reach Concerned through a real 20-second Shorts/Reels session. Confirm its
    one-time line appears. Confirm the right-click debug cycle does not trigger
    it.
-3. Reach the intervention and choose `Take a break`. Confirm the existing tab
-   close still occurs, then confirm the first-break sequence appears after the
-   intervention closes.
+3. Reach the intervention and choose `Take a break`. Confirm the intervention
+   closes, the first-break sequence appears immediately afterward, and the
+   existing tab close still occurs. Repeat with Firefox unavailable and confirm
+   the dialogue still appears.
 4. After accepting a break, become system-idle and resume. Confirm the return
    sequence appears once. Confirm ordinary idle/resume without a preceding
    accepted break produces no return dialogue.

@@ -179,7 +179,9 @@ mod tests {
             Some(WorldEvent::ObjectInspected(WorldObject::EliPhoto))
         );
         assert!(progress.eli_photo_inspected);
+        assert!(progress.is_visible(WorldObject::EliPhoto));
         assert_eq!(engine.inspect(&mut progress, WorldObject::EliPhoto), None);
+        assert!(progress.is_visible(WorldObject::EliPhoto));
     }
 
     #[test]

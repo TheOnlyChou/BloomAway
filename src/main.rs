@@ -12,16 +12,17 @@ use animation::MiloAnimator;
 use behavior::BehaviorController;
 use browser_listener::{BrowserActivityEvent, BrowserBridge, start_browser_activity_monitor};
 use distraction::{DistractionController, DistractionEvent, SECOND_THRESHOLD_SECONDS};
+use gtk::gdk::prelude::GdkCairoContextExt;
 use gtk::prelude::*;
 use gtk4 as gtk;
 use intervention::{
     Intervention, InterventionController, InterventionPresentation, InterventionResponse,
 };
 use milo::browser::{BrowserCommand, BrowserCommandResult};
-use narrative::{DialogueLine, DialogueSequence, NarrativeController};
+use narrative::{DialogueLine, DialogueSequence, NarrativeController, NarrativeTrigger};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -32,28 +33,139 @@ use world::{WorldEvent, WorldObject};
 
 const APPLICATION_ID: &str = "com.milo.desktop";
 const WINDOW_TITLE: &str = "Milo";
-const MILO_DISPLAY_SIZE: i32 = 128;
-const MILO_WINDOW_WIDTH: i32 = 184;
+const MILO_ROOM_PATH: &str = "assets/world/room/milo_room.png";
+const TRANSPARENT_WINDOW_WIDTH: i32 = 184;
+const TRANSPARENT_WINDOW_HEIGHT: i32 = 128;
+const TRANSPARENT_MILO_DISPLAY_SIZE: i32 = 128;
+const ROOM_VIEWPORT_WIDTH: i32 = 400;
+const ROOM_VIEWPORT_HEIGHT: i32 = 260;
+const ROOM_MILO_DISPLAY_SIZE: i32 = 88;
+const ROOM_FLOOR_BASELINE: i32 = 237;
+const ROOM_MILO_X: i32 = 122;
+const ROOM_MILO_Y: i32 = ROOM_FLOOR_BASELINE - ROOM_MILO_DISPLAY_SIZE;
+const ELI_PHOTO_DISPLAY_WIDTH: i32 = 46;
+const ELI_PHOTO_DISPLAY_HEIGHT: i32 = 58;
+const ROOM_ELI_PHOTO_X: i32 = 239;
+const ROOM_ELI_PHOTO_Y: i32 = ROOM_FLOOR_BASELINE - ELI_PHOTO_DISPLAY_HEIGHT;
+const ROOM_CORNER_RADIUS: f64 = 22.0;
+const ELI_PHOTO_THUMBNAIL_PATH: &str = "assets/world/eli_photo/eli_photo_thumbnail.png";
+const ELI_PHOTO_FULL_PATH: &str = "assets/world/eli_photo/eli_photo_full.png";
+
+const _: () = {
+    assert!(ROOM_MILO_Y + ROOM_MILO_DISPLAY_SIZE == ROOM_FLOOR_BASELINE);
+    assert!(ROOM_ELI_PHOTO_Y + ELI_PHOTO_DISPLAY_HEIGHT == ROOM_FLOOR_BASELINE);
+    assert!(ROOM_MILO_X >= 0);
+    assert!(ROOM_MILO_X + ROOM_MILO_DISPLAY_SIZE <= ROOM_VIEWPORT_WIDTH);
+    assert!(ROOM_ELI_PHOTO_X >= 0);
+    assert!(ROOM_ELI_PHOTO_X + ELI_PHOTO_DISPLAY_WIDTH <= ROOM_VIEWPORT_WIDTH);
+    assert!(ROOM_FLOOR_BASELINE <= ROOM_VIEWPORT_HEIGHT);
+};
 
 const ELI_PHOTO_APPEARANCE_DIALOGUE: &[&str] =
     &["I left it here.", "Thought you might want to see it."];
 const ELI_PHOTO_INSPECTION_DIALOGUE: &[&str] = &[
     "That's me.",
-    "The other name is Eli.",
-    "...I haven't seen this in a long time.",
+    "And that's Eli.",
+    "We used to play with that all the time.",
+    "...I haven't seen him in a long time.",
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NarrativeSequenceKind {
+    FirstLaunch,
+    BecameConcerned,
+    BreakAccepted,
+    ReturnedAfterBreak,
+    EliPhotoAppeared,
+    EliPhotoInspection,
+}
+
+impl From<NarrativeTrigger> for NarrativeSequenceKind {
+    fn from(trigger: NarrativeTrigger) -> Self {
+        match trigger {
+            NarrativeTrigger::FirstLaunch => Self::FirstLaunch,
+            NarrativeTrigger::BecameConcerned => Self::BecameConcerned,
+            NarrativeTrigger::BreakAccepted => Self::BreakAccepted,
+            NarrativeTrigger::ReturnedAfterBreak => Self::ReturnedAfterBreak,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NarrativePresentationTarget {
+    MiloBubble,
+    PhotoInspection,
+}
+
+struct NarrativePresentation {
+    kind: NarrativeSequenceKind,
+    target: NarrativePresentationTarget,
+    dialogue: DialogueSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InterventionResponsePlan {
+    record_break_accepted: bool,
+    browser_command: Option<BrowserCommand>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PresentationMode {
+    #[default]
+    TransparentCompanion,
+    Room,
+}
+
+impl PresentationMode {
+    fn from_arguments(arguments: &[OsString]) -> Self {
+        arguments.iter().fold(Self::default(), |mode, argument| {
+            if argument == OsStr::new("--room") {
+                Self::Room
+            } else if argument == OsStr::new("--transparent") {
+                Self::TransparentCompanion
+            } else {
+                mode
+            }
+        })
+    }
+
+    fn is_mode_argument(argument: &OsStr) -> bool {
+        argument == OsStr::new("--room") || argument == OsStr::new("--transparent")
+    }
+
+    fn milo_display_size(self) -> i32 {
+        match self {
+            Self::TransparentCompanion => TRANSPARENT_MILO_DISPLAY_SIZE,
+            Self::Room => ROOM_MILO_DISPLAY_SIZE,
+        }
+    }
+
+    fn window_size(self) -> (i32, i32) {
+        match self {
+            Self::TransparentCompanion => (TRANSPARENT_WINDOW_WIDTH, TRANSPARENT_WINDOW_HEIGHT),
+            Self::Room => (ROOM_VIEWPORT_WIDTH, ROOM_VIEWPORT_HEIGHT),
+        }
+    }
+}
+
 fn main() -> gtk::glib::ExitCode {
-    let debug_intervention =
-        std::env::args_os().any(|argument| argument == OsStr::new("--debug-intervention"));
-    let application_arguments = std::env::args_os()
-        .filter(|argument| argument != OsStr::new("--debug-intervention"))
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    let debug_intervention = arguments
+        .iter()
+        .any(|argument| argument == OsStr::new("--debug-intervention"));
+    let presentation_mode = PresentationMode::from_arguments(&arguments);
+    let application_arguments = arguments
+        .into_iter()
+        .filter(|argument| {
+            argument != OsStr::new("--debug-intervention")
+                && !PresentationMode::is_mode_argument(argument)
+        })
         .collect::<Vec<_>>();
     let app = gtk::Application::builder()
         .application_id(APPLICATION_ID)
         .build();
 
-    app.connect_activate(move |app| build_ui(app, debug_intervention));
+    app.connect_activate(move |app| build_ui(app, debug_intervention, presentation_mode));
 
     let should_quit = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&should_quit);
@@ -73,7 +185,7 @@ fn main() -> gtk::glib::ExitCode {
     app.run_with_args_os(&application_arguments)
 }
 
-fn build_ui(app: &gtk::Application, debug_intervention: bool) {
+fn build_ui(app: &gtk::Application, debug_intervention: bool, presentation_mode: PresentationMode) {
     let css = gtk::CssProvider::new();
     css.load_from_data(
         r#"
@@ -93,6 +205,9 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
             }
 
             popover.milo-intervention > contents {
+                background-color: #2a211d;
+                color: #fff3df;
+                border: 1px solid #80634f;
                 border-radius: 12px;
                 padding: 4px;
             }
@@ -102,32 +217,36 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
             }
 
             popover.milo-narrative > contents {
+                background-color: #2a211d;
+                color: #fff3df;
+                border: 1px solid #80634f;
                 border-radius: 12px;
                 padding: 10px;
             }
 
             button.eli-photo {
-                background-color: #eee5d4;
+                background-color: transparent;
                 background-image: none;
-                border: 1px solid #b9aa91;
-                border-radius: 3px;
-                box-shadow: 0 2px 5px alpha(#000000, 0.28);
-                padding: 4px;
+                border: none;
+                box-shadow: none;
+                padding: 0;
             }
 
             button.eli-photo:hover {
-                background-color: #f7efdf;
+                background-color: alpha(#fff8e9, 0.14);
             }
 
-            .eli-photo-image {
-                background-color: #706b64;
-                border: 1px solid #554f48;
-                border-radius: 1px;
+            popover.eli-photo-inspection > contents {
+                background-color: #241d19;
+                border: 1px solid #6f5b4d;
+                border-radius: 8px;
+                padding: 8px;
             }
 
-            .eli-photo-caption {
-                background-color: #c7baa4;
-                border-radius: 1px;
+            .eli-photo-inspection-caption {
+                color: #f6ead7;
+                font-weight: bold;
+                padding: 8px 6px 4px 6px;
             }
         "#,
     );
@@ -139,31 +258,31 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
 
+    let milo_display_size = presentation_mode.milo_display_size();
     let picture = gtk::Picture::builder()
         .alternative_text("Milo")
         .can_shrink(true)
         .content_fit(gtk::ContentFit::Contain)
-        .width_request(MILO_DISPLAY_SIZE)
-        .height_request(MILO_DISPLAY_SIZE)
+        .width_request(milo_display_size)
+        .height_request(milo_display_size)
         .css_classes(["milo-picture"])
         .build();
 
-    let world_view = WorldView::new();
-    let desktop = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    desktop.set_valign(gtk::Align::End);
-    desktop.append(&picture);
-    desktop.append(world_view.widget());
+    let world_view = WorldView::new().unwrap_or_else(|error| panic!("{error}"));
+    let window_content = build_window_content(presentation_mode, &picture, &world_view)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let (window_width, window_height) = presentation_mode.window_size();
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(WINDOW_TITLE)
-        .default_width(MILO_WINDOW_WIDTH)
-        .default_height(MILO_DISPLAY_SIZE)
+        .default_width(window_width)
+        .default_height(window_height)
         .decorated(false)
         .resizable(false)
         .focusable(false)
         .focus_on_click(false)
-        .child(&desktop)
+        .child(&window_content)
         .build();
     window.add_css_class("milo-window");
 
@@ -172,7 +291,7 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let browser_bridge = BrowserBridge::new();
     let intervention_view = InterventionView::new(&picture);
     let narrative_behavior = behavior.clone();
-    let narrative_view = NarrativeView::new(&picture, move |active| {
+    let narrative_view = NarrativeView::new(&picture, world_view.clone(), move |active| {
         narrative_behavior.set_narrative_active(active);
     });
     let presentation = PresentationCoordinator::new(
@@ -184,8 +303,12 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
     let narrative_presentation = presentation.clone();
     let world_presentation = presentation.clone();
     let narrative = NarrativeController::load(
-        move |dialogue| {
-            narrative_presentation.enqueue_dialogue(dialogue);
+        move |trigger, dialogue| {
+            narrative_presentation.enqueue_dialogue(NarrativePresentation {
+                kind: trigger.into(),
+                target: NarrativePresentationTarget::MiloBubble,
+                dialogue,
+            });
         },
         move |event| {
             world_presentation.handle_world_event(event);
@@ -195,7 +318,7 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
         WorldObject::EliPhoto,
         narrative.is_world_object_visible(WorldObject::EliPhoto),
     );
-    world_view.connect_interaction(&narrative);
+    world_view.connect_interaction(&narrative, &presentation);
     let intervention_presentation = presentation.clone();
     let response_browser_bridge = browser_bridge.clone();
     let response_narrative = narrative.clone();
@@ -204,16 +327,22 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
             intervention_presentation.present_intervention(presentation);
         },
         move |response| {
-            let Some(command) = browser_command_for_intervention_response(response) else {
+            let plan = plan_intervention_response(response);
+            if plan.record_break_accepted {
+                response_narrative.break_accepted();
+            }
+            let Some(command) = plan.browser_command else {
                 return;
             };
 
-            response_narrative.break_accepted();
-            eprintln!("[milo] browser command requested: {command:?}");
-            match response_browser_bridge.send(command) {
-                Ok(()) => eprintln!("[milo] browser command sent: {command:?}"),
-                Err(error) => eprintln!("[milo] browser command unavailable: {error}"),
-            }
+            let browser_bridge = response_browser_bridge.clone();
+            gtk::glib::idle_add_local_once(move || {
+                eprintln!("[milo] browser command requested: {command:?}");
+                match browser_bridge.send(command) {
+                    Ok(()) => eprintln!("[milo] browser command sent: {command:?}"),
+                    Err(error) => eprintln!("[milo] browser command unavailable: {error}"),
+                }
+            });
         },
     ));
     intervention_view.connect_responses(&intervention);
@@ -284,6 +413,112 @@ fn build_ui(app: &gtk::Application, debug_intervention: bool) {
                 .present_intervention(InterventionPresentation::Show(Intervention::StillScrolling));
         });
     }
+}
+
+fn build_window_content(
+    presentation_mode: PresentationMode,
+    picture: &gtk::Picture,
+    world_view: &WorldView,
+) -> Result<gtk::Widget, String> {
+    match presentation_mode {
+        PresentationMode::TransparentCompanion => {
+            world_view.widget().set_valign(gtk::Align::End);
+            world_view.widget().set_margin_bottom(8);
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            content.set_valign(gtk::Align::End);
+            content.append(picture);
+            content.append(world_view.widget());
+            Ok(content.upcast())
+        }
+        PresentationMode::Room => {
+            let room_background = build_room_background()?;
+            eprintln!("[milo] world background loaded: MiloRoom");
+            let world_content = gtk::Fixed::new();
+            world_content.put(picture, f64::from(ROOM_MILO_X), f64::from(ROOM_MILO_Y));
+            world_content.put(
+                world_view.widget(),
+                f64::from(ROOM_ELI_PHOTO_X),
+                f64::from(ROOM_ELI_PHOTO_Y),
+            );
+
+            let room = gtk::Overlay::new();
+            room.set_child(Some(&room_background));
+            room.add_overlay(&world_content);
+            room.set_measure_overlay(&world_content, false);
+            Ok(room.upcast())
+        }
+    }
+}
+
+fn build_room_background() -> Result<gtk::DrawingArea, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(MILO_ROOM_PATH);
+    let pixbuf = gtk::gdk::gdk_pixbuf::Pixbuf::from_file(&path)
+        .map_err(|error| format!("failed to load room artwork {}: {error}", path.display()))?;
+    let background = gtk::DrawingArea::builder()
+        .content_width(ROOM_VIEWPORT_WIDTH)
+        .content_height(ROOM_VIEWPORT_HEIGHT)
+        .build();
+    background.set_can_target(false);
+    background.set_draw_func(move |_, context, width, height| {
+        let width = f64::from(width);
+        let height = f64::from(height);
+        add_rounded_rectangle(context, 0.0, 0.0, width, height, ROOM_CORNER_RADIUS);
+        context.save().expect("failed to save room drawing context");
+        context.clip();
+
+        let image_width = f64::from(pixbuf.width());
+        let image_height = f64::from(pixbuf.height());
+        let scale = (width / image_width).max(height / image_height);
+        let x = (width - image_width * scale) / 2.0;
+        let y = (height - image_height * scale) / 2.0;
+        context.translate(x, y);
+        context.scale(scale, scale);
+        context.set_source_pixbuf(&pixbuf, 0.0, 0.0);
+        context.source().set_filter(gtk::cairo::Filter::Best);
+        context.paint().expect("failed to paint room background");
+        context
+            .restore()
+            .expect("failed to restore room drawing context");
+
+        let border_inset = 0.75;
+        add_rounded_rectangle(
+            context,
+            border_inset,
+            border_inset,
+            width - border_inset * 2.0,
+            height - border_inset * 2.0,
+            ROOM_CORNER_RADIUS - border_inset,
+        );
+        context.set_source_rgba(0.45, 0.29, 0.20, 0.75);
+        context.set_line_width(border_inset * 2.0);
+        context.stroke().expect("failed to paint room border");
+    });
+
+    Ok(background)
+}
+
+fn add_rounded_rectangle(
+    context: &gtk::cairo::Context,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    radius: f64,
+) {
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    context.new_sub_path();
+    context.arc(x + width - radius, y + radius, radius, -FRAC_PI_2, 0.0);
+    context.arc(
+        x + width - radius,
+        y + height - radius,
+        radius,
+        0.0,
+        FRAC_PI_2,
+    );
+    context.arc(x + radius, y + height - radius, radius, FRAC_PI_2, PI);
+    context.arc(x + radius, y + radius, radius, PI, PI + FRAC_PI_2);
+    context.close_path();
 }
 
 #[derive(Default)]
@@ -357,86 +592,144 @@ impl PresentationCoordinator {
         world: WorldView,
         behavior: BehaviorController,
     ) -> Self {
-        Self {
+        let coordinator = Self {
             intervention,
             narrative,
             world,
             behavior,
-        }
+        };
+        coordinator.connect_intervention_closed();
+        coordinator
     }
 
     fn present_intervention(&self, presentation: InterventionPresentation) {
         match presentation {
             InterventionPresentation::Show(_) => {
+                self.world.close_inspection();
                 self.behavior.set_intervention_visible(true);
                 self.narrative.set_intervention_visible(true);
                 self.intervention.present(presentation);
             }
             InterventionPresentation::Hide => {
+                let was_visible = self.intervention.is_visible();
                 self.intervention.present(presentation);
-                self.narrative.set_intervention_visible(false);
-                self.behavior.set_intervention_visible(false);
+                if !was_visible {
+                    self.resume_after_intervention();
+                }
             }
         }
     }
 
-    fn enqueue_dialogue(&self, dialogue: DialogueSequence) {
-        self.narrative.enqueue(dialogue);
+    fn connect_intervention_closed(&self) {
+        let narrative = self.narrative.clone();
+        let behavior = self.behavior.clone();
+        self.intervention.connect_closed(move || {
+            narrative.set_intervention_visible(false);
+            behavior.set_intervention_visible(false);
+        });
+    }
+
+    fn resume_after_intervention(&self) {
+        self.narrative.set_intervention_visible(false);
+        self.behavior.set_intervention_visible(false);
+    }
+
+    fn enqueue_dialogue(&self, presentation: NarrativePresentation) {
+        self.narrative.enqueue(presentation);
     }
 
     fn handle_world_event(&self, event: WorldEvent) {
         if event == WorldEvent::EliPhotoAppeared {
             self.world.set_object_visible(WorldObject::EliPhoto, true);
         }
-        if let Some(dialogue) = dialogue_for_world_event(event) {
-            self.enqueue_dialogue(dialogue);
+        if let Some(presentation) = dialogue_for_world_event(event) {
+            self.enqueue_dialogue(presentation);
         }
     }
 }
 
-fn dialogue_for_world_event(event: WorldEvent) -> Option<DialogueSequence> {
+fn dialogue_for_world_event(event: WorldEvent) -> Option<NarrativePresentation> {
     match event {
         WorldEvent::ObjectPending(_) => None,
-        WorldEvent::EliPhotoAppeared => Some(DialogueSequence::new(ELI_PHOTO_APPEARANCE_DIALOGUE)),
-        WorldEvent::ObjectInspected(WorldObject::EliPhoto) => {
-            Some(DialogueSequence::new(ELI_PHOTO_INSPECTION_DIALOGUE))
-        }
+        WorldEvent::EliPhotoAppeared => Some(NarrativePresentation {
+            kind: NarrativeSequenceKind::EliPhotoAppeared,
+            target: NarrativePresentationTarget::MiloBubble,
+            dialogue: DialogueSequence::new(ELI_PHOTO_APPEARANCE_DIALOGUE),
+        }),
+        WorldEvent::ObjectInspected(WorldObject::EliPhoto) => Some(NarrativePresentation {
+            kind: NarrativeSequenceKind::EliPhotoInspection,
+            target: NarrativePresentationTarget::PhotoInspection,
+            dialogue: DialogueSequence::new(ELI_PHOTO_INSPECTION_DIALOGUE),
+        }),
     }
 }
 
 #[derive(Clone)]
 struct WorldView {
     eli_photo: gtk::Button,
+    inspection: gtk::Popover,
+    inspection_caption: gtk::Label,
 }
 
 impl WorldView {
-    fn new() -> Self {
-        let image = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        image.set_size_request(34, 34);
-        image.add_css_class("eli-photo-image");
-
-        let caption = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        caption.set_size_request(24, 3);
-        caption.set_halign(gtk::Align::Center);
-        caption.add_css_class("eli-photo-caption");
-
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        card.append(&image);
-        card.append(&caption);
+    fn new() -> Result<Self, String> {
+        let thumbnail_texture = load_world_texture(
+            ELI_PHOTO_THUMBNAIL_PATH,
+            ELI_PHOTO_DISPLAY_WIDTH,
+            ELI_PHOTO_DISPLAY_HEIGHT,
+        )?;
+        let thumbnail = gtk::Picture::builder()
+            .alternative_text("An old photograph of Milo and Eli")
+            .paintable(&thumbnail_texture)
+            .can_shrink(true)
+            .content_fit(gtk::ContentFit::Contain)
+            .width_request(ELI_PHOTO_DISPLAY_WIDTH)
+            .height_request(ELI_PHOTO_DISPLAY_HEIGHT)
+            .build();
 
         let eli_photo = gtk::Button::builder()
             .tooltip_text("An old photograph")
-            .width_request(46)
-            .height_request(56)
-            .valign(gtk::Align::End)
-            .margin_bottom(8)
-            .child(&card)
+            .width_request(ELI_PHOTO_DISPLAY_WIDTH)
+            .height_request(ELI_PHOTO_DISPLAY_HEIGHT)
+            .child(&thumbnail)
             .visible(false)
             .build();
         eli_photo.add_css_class("eli-photo");
         eli_photo.set_focus_on_click(false);
 
-        Self { eli_photo }
+        let full_texture = load_world_texture(ELI_PHOTO_FULL_PATH, 320, 400)?;
+        let full_photo = gtk::Picture::builder()
+            .alternative_text("Milo and Eli playing together with a yarn ball")
+            .paintable(&full_texture)
+            .can_shrink(true)
+            .content_fit(gtk::ContentFit::Contain)
+            .width_request(320)
+            .height_request(400)
+            .build();
+        let inspection_caption = gtk::Label::builder()
+            .halign(gtk::Align::Center)
+            .wrap(true)
+            .max_width_chars(40)
+            .visible(false)
+            .css_classes(["eli-photo-inspection-caption"])
+            .build();
+        let inspection_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inspection_content.append(&full_photo);
+        inspection_content.append(&inspection_caption);
+        let inspection = gtk::Popover::builder()
+            .autohide(true)
+            .has_arrow(true)
+            .position(gtk::PositionType::Top)
+            .child(&inspection_content)
+            .build();
+        inspection.add_css_class("eli-photo-inspection");
+        inspection.set_parent(&eli_photo);
+
+        Ok(Self {
+            eli_photo,
+            inspection,
+            inspection_caption,
+        })
     }
 
     fn widget(&self) -> &gtk::Button {
@@ -449,29 +742,141 @@ impl WorldView {
         }
     }
 
-    fn connect_interaction(&self, narrative: &NarrativeController) {
+    fn close_inspection(&self) {
+        self.inspection_caption.set_visible(false);
+        self.inspection.popdown();
+    }
+
+    fn show_inspection_line(&self, text: &str) {
+        self.inspection_caption.set_label(text);
+        self.inspection_caption.set_visible(true);
+        self.inspection.popup();
+    }
+
+    fn hide_inspection_line(&self) {
+        self.inspection_caption.set_visible(false);
+    }
+
+    fn connect_interaction(
+        &self,
+        narrative: &NarrativeController,
+        presentation: &PresentationCoordinator,
+    ) {
         let narrative = narrative.clone();
+        let intervention = presentation.intervention.clone();
+        let narrative_view = presentation.narrative.clone();
+        let weak_inspection = self.inspection.downgrade();
         self.eli_photo.connect_clicked(move |_| {
+            if intervention.is_visible() || narrative_view.is_active() {
+                return;
+            }
+            let Some(inspection) = weak_inspection.upgrade() else {
+                return;
+            };
+
+            inspection.popup();
+            eprintln!("[milo] world object opened: EliPhoto");
             narrative.inspect_world_object(WorldObject::EliPhoto);
         });
     }
 }
 
+fn load_world_texture(
+    relative_path: &str,
+    width: i32,
+    height: i32,
+) -> Result<gtk::gdk::Texture, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+    let pixbuf = gtk::gdk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, width, height, true)
+        .map_err(|error| format!("failed to load world artwork {}: {error}", path.display()))?;
+    Ok(gtk::gdk::Texture::for_pixbuf(&pixbuf))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PresentedDialogueLine {
+    target: NarrativePresentationTarget,
+    line: DialogueLine,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum NarrativePump {
+    SuppressedByIntervention,
+    Present {
+        line: PresentedDialogueLine,
+        is_new: bool,
+    },
+    Finished {
+        was_active: bool,
+    },
+}
+
 #[derive(Default)]
-struct NarrativeViewState {
-    queued_lines: VecDeque<DialogueLine>,
-    current_line: Option<DialogueLine>,
-    timeout: Option<gtk::glib::SourceId>,
+struct NarrativePresentationState {
+    queued_lines: VecDeque<PresentedDialogueLine>,
+    current_line: Option<PresentedDialogueLine>,
     intervention_visible: bool,
     active: bool,
+}
+
+impl NarrativePresentationState {
+    fn enqueue(&mut self, presentation: NarrativePresentation) -> bool {
+        let NarrativePresentation {
+            target, dialogue, ..
+        } = presentation;
+        self.queued_lines.extend(
+            dialogue
+                .into_lines()
+                .map(|line| PresentedDialogueLine { target, line }),
+        );
+        if self.active {
+            false
+        } else {
+            self.active = true;
+            true
+        }
+    }
+
+    fn set_intervention_visible(&mut self, visible: bool) -> bool {
+        let changed = self.intervention_visible != visible;
+        self.intervention_visible = visible;
+        changed
+    }
+
+    fn pump(&mut self) -> NarrativePump {
+        if self.intervention_visible {
+            return NarrativePump::SuppressedByIntervention;
+        }
+
+        if let Some(line) = self.current_line {
+            return NarrativePump::Present {
+                line,
+                is_new: false,
+            };
+        }
+
+        if let Some(line) = self.queued_lines.pop_front() {
+            self.current_line = Some(line);
+            return NarrativePump::Present { line, is_new: true };
+        }
+
+        let was_active = self.active;
+        self.active = false;
+        NarrativePump::Finished { was_active }
+    }
+
+    fn complete_current_line(&mut self) -> Option<PresentedDialogueLine> {
+        self.current_line.take()
+    }
 }
 
 type NarrativeActivityHandler = RefCell<Box<dyn FnMut(bool)>>;
 
 struct NarrativeViewInner {
-    popover: gtk::Popover,
-    label: gtk::Label,
-    state: RefCell<NarrativeViewState>,
+    milo_popover: gtk::Popover,
+    milo_label: gtk::Label,
+    world: WorldView,
+    state: RefCell<NarrativePresentationState>,
+    timeout: RefCell<Option<gtk::glib::SourceId>>,
     activity_handler: NarrativeActivityHandler,
 }
 
@@ -481,119 +886,168 @@ struct NarrativeView {
 }
 
 impl NarrativeView {
-    fn new<F>(anchor: &gtk::Picture, activity_handler: F) -> Self
+    fn new<F>(anchor: &gtk::Picture, world: WorldView, activity_handler: F) -> Self
     where
         F: FnMut(bool) + 'static,
     {
-        let label = gtk::Label::builder()
+        let milo_label = gtk::Label::builder()
             .halign(gtk::Align::Start)
             .wrap(true)
             .max_width_chars(32)
             .build();
-        let popover = gtk::Popover::builder()
+        let milo_popover = gtk::Popover::builder()
             .autohide(false)
             .has_arrow(true)
             .position(gtk::PositionType::Top)
-            .child(&label)
+            .child(&milo_label)
             .build();
-        popover.add_css_class("milo-narrative");
-        popover.set_can_target(false);
-        popover.set_parent(anchor);
+        milo_popover.add_css_class("milo-narrative");
+        milo_popover.set_can_target(false);
+        milo_popover.set_parent(anchor);
 
         Self {
             inner: Rc::new(NarrativeViewInner {
-                popover,
-                label,
-                state: RefCell::new(NarrativeViewState::default()),
+                milo_popover,
+                milo_label,
+                world,
+                state: RefCell::new(NarrativePresentationState::default()),
+                timeout: RefCell::new(None),
                 activity_handler: RefCell::new(Box::new(activity_handler)),
             }),
         }
     }
 
-    fn enqueue(&self, dialogue: DialogueSequence) {
-        let mut lines = dialogue.into_lines().peekable();
-        if lines.peek().is_none() {
+    fn enqueue(&self, presentation: NarrativePresentation) {
+        if presentation.dialogue.clone().into_lines().next().is_none() {
             return;
         }
+        eprintln!("[milo] narrative sequence queued: {:?}", presentation.kind);
 
-        let became_active = {
+        let (became_active, suppressed) = {
             let mut state = self.inner.state.borrow_mut();
-            state.queued_lines.extend(lines);
-            if state.active {
-                false
-            } else {
-                state.active = true;
-                true
-            }
+            let became_active = state.enqueue(presentation);
+            (became_active, state.intervention_visible)
         };
         if became_active {
             (self.inner.activity_handler.borrow_mut())(true);
         }
+        if suppressed {
+            eprintln!("[milo] narrative paused: intervention");
+            eprintln!("[milo] narrative suppression: intervention");
+        }
         self.show_next_line();
     }
 
+    fn is_active(&self) -> bool {
+        self.inner.state.borrow().active
+    }
+
     fn set_intervention_visible(&self, visible: bool) {
-        let timeout = {
+        let (changed, active, current_target) = {
             let mut state = self.inner.state.borrow_mut();
-            state.intervention_visible = visible;
-            if visible { state.timeout.take() } else { None }
+            let changed = state.set_intervention_visible(visible);
+            (
+                changed,
+                state.active,
+                state.current_line.map(|line| line.target),
+            )
         };
-        if let Some(timeout) = timeout {
-            timeout.remove();
+        if !changed {
+            return;
         }
+
         if visible {
-            self.inner.popover.popdown();
+            if let Some(timeout) = self.inner.timeout.borrow_mut().take() {
+                timeout.remove();
+            }
+            if active {
+                eprintln!("[milo] narrative paused: intervention");
+                eprintln!("[milo] narrative suppression: intervention");
+            }
+            self.hide_target_for_intervention(current_target);
         } else {
+            if active {
+                eprintln!("[milo] narrative resumed");
+            }
             self.show_next_line();
         }
     }
 
     fn show_next_line(&self) {
-        let (line, is_new) = {
-            let mut state = self.inner.state.borrow_mut();
-            if state.intervention_visible || state.timeout.is_some() {
+        if self.inner.timeout.borrow().is_some() {
+            return;
+        }
+
+        let pump = self.inner.state.borrow_mut().pump();
+        let (presented, is_new) = match pump {
+            NarrativePump::SuppressedByIntervention => return,
+            NarrativePump::Finished { was_active } => {
+                self.inner.milo_popover.popdown();
+                self.inner.world.hide_inspection_line();
+                if was_active {
+                    (self.inner.activity_handler.borrow_mut())(false);
+                }
                 return;
             }
-
-            match state.current_line {
-                Some(line) => (line, false),
-                None => {
-                    let Some(line) = state.queued_lines.pop_front() else {
-                        let became_inactive = state.active;
-                        state.active = false;
-                        drop(state);
-                        self.inner.popover.popdown();
-                        if became_inactive {
-                            (self.inner.activity_handler.borrow_mut())(false);
-                        }
-                        return;
-                    };
-                    state.current_line = Some(line);
-                    (line, true)
-                }
-            }
+            NarrativePump::Present { line, is_new } => (line, is_new),
         };
 
-        self.inner.label.set_label(line.text);
         if is_new {
-            eprintln!("[milo] narrative dialogue: {:?}", line.text);
+            eprintln!(
+                "[milo] narrative presentation target: {:?}",
+                presented.target
+            );
+            eprintln!("[milo] narrative dialogue: {:?}", presented.line.text);
         }
-        self.inner.popover.popup();
+        self.show_target(presented);
 
         let weak_inner = Rc::downgrade(&self.inner);
-        let timeout = gtk::glib::timeout_add_local_once(line.duration, move || {
+        let timeout = gtk::glib::timeout_add_local_once(presented.line.duration, move || {
             let Some(inner) = weak_inner.upgrade() else {
                 return;
             };
-            {
-                let mut state = inner.state.borrow_mut();
-                state.timeout.take();
-                state.current_line = None;
+            inner.timeout.borrow_mut().take();
+            if let Some(completed) = inner.state.borrow_mut().complete_current_line() {
+                match completed.target {
+                    NarrativePresentationTarget::MiloBubble => {
+                        inner.milo_popover.popdown();
+                        eprintln!("[milo] narrative popover: Hide");
+                    }
+                    NarrativePresentationTarget::PhotoInspection => {
+                        inner.world.hide_inspection_line();
+                    }
+                }
             }
-            inner.popover.popdown();
             Self { inner }.show_next_line();
         });
-        self.inner.state.borrow_mut().timeout = Some(timeout);
+        self.inner.timeout.replace(Some(timeout));
+    }
+
+    fn show_target(&self, presented: PresentedDialogueLine) {
+        match presented.target {
+            NarrativePresentationTarget::MiloBubble => {
+                self.inner.world.close_inspection();
+                self.inner.milo_label.set_label(presented.line.text);
+                self.inner.milo_popover.popup();
+                eprintln!("[milo] narrative popover: Show");
+            }
+            NarrativePresentationTarget::PhotoInspection => {
+                self.inner.world.show_inspection_line(presented.line.text);
+            }
+        }
+    }
+
+    fn hide_target_for_intervention(&self, target: Option<NarrativePresentationTarget>) {
+        match target {
+            Some(NarrativePresentationTarget::MiloBubble) => {
+                self.inner.milo_popover.popdown();
+                eprintln!("[milo] narrative popover: Hide");
+            }
+            Some(NarrativePresentationTarget::PhotoInspection) => {
+                self.inner.world.close_inspection();
+            }
+            None => {}
+        }
     }
 }
 
@@ -601,12 +1055,16 @@ fn log_browser_command_result(result: BrowserCommandResult) {
     eprintln!("[milo] browser command result: {result}");
 }
 
-fn browser_command_for_intervention_response(
-    response: InterventionResponse,
-) -> Option<BrowserCommand> {
+fn plan_intervention_response(response: InterventionResponse) -> InterventionResponsePlan {
     match response {
-        InterventionResponse::TakeBreak => Some(BrowserCommand::CloseActiveDistractionTab),
-        InterventionResponse::KeepScrolling => None,
+        InterventionResponse::TakeBreak => InterventionResponsePlan {
+            record_break_accepted: true,
+            browser_command: Some(BrowserCommand::CloseActiveDistractionTab),
+        },
+        InterventionResponse::KeepScrolling => InterventionResponsePlan {
+            record_break_accepted: false,
+            browser_command: None,
+        },
     }
 }
 
@@ -614,19 +1072,48 @@ fn browser_command_for_intervention_response(
 mod tests {
     use super::*;
 
+    fn arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
     fn dialogue_text(dialogue: DialogueSequence) -> Vec<&'static str> {
         dialogue.into_lines().map(|line| line.text).collect()
     }
 
+    fn presentation(
+        kind: NarrativeSequenceKind,
+        target: NarrativePresentationTarget,
+        lines: &[&'static str],
+    ) -> NarrativePresentation {
+        NarrativePresentation {
+            kind,
+            target,
+            dialogue: DialogueSequence::new(lines),
+        }
+    }
+
+    fn presented_line(pump: NarrativePump) -> (PresentedDialogueLine, bool) {
+        match pump {
+            NarrativePump::Present { line, is_new } => (line, is_new),
+            other => panic!("expected a presentable narrative line, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn only_take_break_maps_to_a_browser_command() {
+    fn take_break_narrative_is_planned_independently_from_browser_delivery() {
         assert_eq!(
-            browser_command_for_intervention_response(InterventionResponse::TakeBreak),
-            Some(BrowserCommand::CloseActiveDistractionTab)
+            plan_intervention_response(InterventionResponse::TakeBreak),
+            InterventionResponsePlan {
+                record_break_accepted: true,
+                browser_command: Some(BrowserCommand::CloseActiveDistractionTab),
+            }
         );
         assert_eq!(
-            browser_command_for_intervention_response(InterventionResponse::KeepScrolling),
-            None
+            plan_intervention_response(InterventionResponse::KeepScrolling),
+            InterventionResponsePlan {
+                record_break_accepted: false,
+                browser_command: None,
+            }
         );
     }
 
@@ -643,20 +1130,168 @@ mod tests {
     }
 
     #[test]
-    fn world_events_map_to_the_expected_dialogue() {
+    fn transparent_companion_is_the_default_and_explicit_alias() {
         assert_eq!(
-            dialogue_text(dialogue_for_world_event(WorldEvent::EliPhotoAppeared).unwrap()),
-            ["I left it here.", "Thought you might want to see it."]
+            PresentationMode::from_arguments(&arguments(&["milo"])),
+            PresentationMode::TransparentCompanion
         );
         assert_eq!(
-            dialogue_text(
-                dialogue_for_world_event(WorldEvent::ObjectInspected(WorldObject::EliPhoto))
-                    .unwrap()
-            ),
+            PresentationMode::from_arguments(&arguments(&["milo", "--room", "--transparent"])),
+            PresentationMode::TransparentCompanion
+        );
+        assert_eq!(
+            PresentationMode::TransparentCompanion.window_size(),
+            (TRANSPARENT_WINDOW_WIDTH, TRANSPARENT_WINDOW_HEIGHT)
+        );
+        assert_eq!(
+            PresentationMode::TransparentCompanion.milo_display_size(),
+            TRANSPARENT_MILO_DISPLAY_SIZE
+        );
+    }
+
+    #[test]
+    fn room_argument_selects_the_compact_room_layout() {
+        let mode = PresentationMode::from_arguments(&arguments(&["milo", "--room"]));
+
+        assert_eq!(mode, PresentationMode::Room);
+        assert_eq!(
+            mode.window_size(),
+            (ROOM_VIEWPORT_WIDTH, ROOM_VIEWPORT_HEIGHT)
+        );
+        assert_eq!(mode.milo_display_size(), ROOM_MILO_DISPLAY_SIZE);
+    }
+
+    #[test]
+    fn break_accepted_queued_during_intervention_resumes_without_loss() {
+        let mut state = NarrativePresentationState::default();
+        assert!(state.set_intervention_visible(true));
+        assert!(state.enqueue(presentation(
+            NarrativeSequenceKind::BreakAccepted,
+            NarrativePresentationTarget::MiloBubble,
+            &["Good.", "...I mean, I'll be fine."],
+        )));
+
+        assert_eq!(state.pump(), NarrativePump::SuppressedByIntervention);
+        assert_eq!(state.queued_lines.len(), 2);
+
+        assert!(state.set_intervention_visible(false));
+        let (first, is_new) = presented_line(state.pump());
+        assert!(is_new);
+        assert_eq!(first.line.text, "Good.");
+
+        assert_eq!(state.complete_current_line(), Some(first));
+        let (second, is_new) = presented_line(state.pump());
+        assert!(is_new);
+        assert_eq!(second.line.text, "...I mean, I'll be fine.");
+    }
+
+    #[test]
+    fn interrupted_line_resumes_without_restarting_or_advancing() {
+        let mut state = NarrativePresentationState::default();
+        state.enqueue(presentation(
+            NarrativeSequenceKind::BecameConcerned,
+            NarrativePresentationTarget::MiloBubble,
+            &["current", "next"],
+        ));
+        let (current, is_new) = presented_line(state.pump());
+        assert!(is_new);
+
+        state.set_intervention_visible(true);
+        assert_eq!(state.pump(), NarrativePump::SuppressedByIntervention);
+        state.set_intervention_visible(false);
+
+        let (resumed, is_new) = presented_line(state.pump());
+        assert!(!is_new);
+        assert_eq!(resumed, current);
+        state.complete_current_line();
+        let (next, is_new) = presented_line(state.pump());
+        assert!(is_new);
+        assert_eq!(next.line.text, "next");
+    }
+
+    #[test]
+    fn photo_inspection_is_a_target_not_a_suppression_reason() {
+        let mut state = NarrativePresentationState::default();
+        state.enqueue(presentation(
+            NarrativeSequenceKind::EliPhotoInspection,
+            NarrativePresentationTarget::PhotoInspection,
+            &["That's me."],
+        ));
+
+        let (line, is_new) = presented_line(state.pump());
+        assert!(is_new);
+        assert_eq!(line.target, NarrativePresentationTarget::PhotoInspection);
+        assert_eq!(line.line.text, "That's me.");
+    }
+
+    #[test]
+    fn intervention_suppresses_then_resumes_photo_inspection_target() {
+        let mut state = NarrativePresentationState::default();
+        state.enqueue(presentation(
+            NarrativeSequenceKind::EliPhotoInspection,
+            NarrativePresentationTarget::PhotoInspection,
+            &["That's me.", "And that's Eli."],
+        ));
+        let (current, _) = presented_line(state.pump());
+
+        state.set_intervention_visible(true);
+        assert_eq!(state.pump(), NarrativePump::SuppressedByIntervention);
+        state.set_intervention_visible(false);
+
+        let (resumed, is_new) = presented_line(state.pump());
+        assert!(!is_new);
+        assert_eq!(resumed, current);
+        assert_eq!(resumed.target, NarrativePresentationTarget::PhotoInspection);
+    }
+
+    #[test]
+    fn mixed_targets_preserve_queue_order() {
+        let mut state = NarrativePresentationState::default();
+        state.enqueue(presentation(
+            NarrativeSequenceKind::FirstLaunch,
+            NarrativePresentationTarget::MiloBubble,
+            &["first"],
+        ));
+        state.enqueue(presentation(
+            NarrativeSequenceKind::EliPhotoInspection,
+            NarrativePresentationTarget::PhotoInspection,
+            &["second"],
+        ));
+
+        let (first, _) = presented_line(state.pump());
+        assert_eq!(first.line.text, "first");
+        assert_eq!(first.target, NarrativePresentationTarget::MiloBubble);
+        state.complete_current_line();
+
+        let (second, _) = presented_line(state.pump());
+        assert_eq!(second.line.text, "second");
+        assert_eq!(second.target, NarrativePresentationTarget::PhotoInspection);
+    }
+
+    #[test]
+    fn world_events_map_to_the_expected_dialogue() {
+        let appearance = dialogue_for_world_event(WorldEvent::EliPhotoAppeared).unwrap();
+        assert_eq!(appearance.kind, NarrativeSequenceKind::EliPhotoAppeared);
+        assert_eq!(appearance.target, NarrativePresentationTarget::MiloBubble);
+        assert_eq!(
+            dialogue_text(appearance.dialogue),
+            ["I left it here.", "Thought you might want to see it."]
+        );
+
+        let inspection =
+            dialogue_for_world_event(WorldEvent::ObjectInspected(WorldObject::EliPhoto)).unwrap();
+        assert_eq!(inspection.kind, NarrativeSequenceKind::EliPhotoInspection);
+        assert_eq!(
+            inspection.target,
+            NarrativePresentationTarget::PhotoInspection
+        );
+        assert_eq!(
+            dialogue_text(inspection.dialogue),
             [
                 "That's me.",
-                "The other name is Eli.",
-                "...I haven't seen this in a long time."
+                "And that's Eli.",
+                "We used to play with that all the time.",
+                "...I haven't seen him in a long time."
             ]
         );
         assert!(
@@ -671,6 +1306,7 @@ struct InterventionView {
     prompt: gtk::Label,
     take_break: gtk::Button,
     keep_scrolling: gtk::Button,
+    visible: Rc<Cell<bool>>,
 }
 
 impl InterventionView {
@@ -710,6 +1346,7 @@ impl InterventionView {
             prompt,
             take_break,
             keep_scrolling,
+            visible: Rc::new(Cell::new(false)),
         }
     }
 
@@ -729,9 +1366,25 @@ impl InterventionView {
         });
     }
 
+    fn is_visible(&self) -> bool {
+        self.visible.get()
+    }
+
+    fn connect_closed<F>(&self, handler: F)
+    where
+        F: Fn() + 'static,
+    {
+        let visible = Rc::clone(&self.visible);
+        self.popover.connect_closed(move |_| {
+            visible.set(false);
+            handler();
+        });
+    }
+
     fn present(&self, presentation: InterventionPresentation) {
         match presentation {
             InterventionPresentation::Show(intervention) => {
+                self.visible.set(true);
                 self.prompt.set_label(intervention.prompt());
                 eprintln!("[milo] GTK: calling intervention popover.popup()");
                 self.popover.popup();

@@ -214,7 +214,7 @@ impl NarrativeStore {
     }
 }
 
-type DialogueHandler = Rc<RefCell<Box<dyn FnMut(DialogueSequence)>>>;
+type DialogueHandler = Rc<RefCell<Box<dyn FnMut(NarrativeTrigger, DialogueSequence)>>>;
 type WorldEventHandler = Rc<RefCell<Box<dyn FnMut(WorldEvent)>>>;
 
 #[derive(Clone)]
@@ -229,7 +229,7 @@ pub struct NarrativeController {
 impl NarrativeController {
     pub fn load<F, G>(dialogue_handler: F, world_event_handler: G) -> Self
     where
-        F: FnMut(DialogueSequence) + 'static,
+        F: FnMut(NarrativeTrigger, DialogueSequence) + 'static,
         G: FnMut(WorldEvent) + 'static,
     {
         let (store, mut progress) = NarrativeStore::load();
@@ -335,7 +335,7 @@ impl NarrativeController {
             eprintln!("[milo] narrative milestone: {milestone:?}");
         }
         if let Some(dialogue) = update.dialogue {
-            (self.dialogue_handler.borrow_mut())(dialogue);
+            (self.dialogue_handler.borrow_mut())(update.trigger, dialogue);
         }
     }
 
